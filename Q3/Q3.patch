@@ -1,0 +1,2263 @@
+diff --git a/drivers/net/wireless/intel/iwlwifi/cfg/22000.c b/drivers/net/wireless/intel/iwlwifi/cfg/22000.c
+index d8231cc82..37d716d58 100644
+--- a/drivers/net/wireless/intel/iwlwifi/cfg/22000.c
++++ b/drivers/net/wireless/intel/iwlwifi/cfg/22000.c
+@@ -9,7 +9,7 @@
+ #include "iwl-prph.h"
+ 
+ /* Highest firmware API version supported */
+-#define IWL_22000_UCODE_API_MAX	66
++#define IWL_22000_UCODE_API_MAX	67
+ 
+ /* Lowest firmware API version supported */
+ #define IWL_22000_UCODE_API_MIN	39
+diff --git a/drivers/net/wireless/intel/iwlwifi/fw/acpi.c b/drivers/net/wireless/intel/iwlwifi/fw/acpi.c
+index 9e00d1d7e..96c02e17f 100644
+--- a/drivers/net/wireless/intel/iwlwifi/fw/acpi.c
++++ b/drivers/net/wireless/intel/iwlwifi/fw/acpi.c
+@@ -184,9 +184,11 @@ int iwl_acpi_get_dsm_u32(struct device *dev, int rev, int func,
+ }
+ IWL_EXPORT_SYMBOL(iwl_acpi_get_dsm_u32);
+ 
+-union acpi_object *iwl_acpi_get_wifi_pkg(struct device *dev,
+-					 union acpi_object *data,
+-					 int data_size, int *tbl_rev)
++union acpi_object *iwl_acpi_get_wifi_pkg_range(struct device *dev,
++					       union acpi_object *data,
++					       int min_data_size,
++					       int max_data_size,
++					       int *tbl_rev)
+ {
+ 	int i;
+ 	union acpi_object *wifi_pkg;
+@@ -196,7 +198,7 @@ union acpi_object *iwl_acpi_get_wifi_pkg(struct device *dev,
+ 	 * describes the domain, and one more entry, otherwise there's
+ 	 * no point in reading it.
+ 	 */
+-	if (WARN_ON_ONCE(data_size < 2))
++	if (WARN_ON_ONCE(min_data_size < 2 || min_data_size > max_data_size))
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	/*
+@@ -222,7 +224,8 @@ union acpi_object *iwl_acpi_get_wifi_pkg(struct device *dev,
+ 
+ 		/* skip entries that are not a package with the right size */
+ 		if (wifi_pkg->type != ACPI_TYPE_PACKAGE ||
+-		    wifi_pkg->package.count != data_size)
++		    wifi_pkg->package.count < min_data_size ||
++		    wifi_pkg->package.count > max_data_size)
+ 			continue;
+ 
+ 		domain = &wifi_pkg->package.elements[0];
+@@ -236,7 +239,7 @@ union acpi_object *iwl_acpi_get_wifi_pkg(struct device *dev,
+ found:
+ 	return wifi_pkg;
+ }
+-IWL_EXPORT_SYMBOL(iwl_acpi_get_wifi_pkg);
++IWL_EXPORT_SYMBOL(iwl_acpi_get_wifi_pkg_range);
+ 
+ int iwl_acpi_get_tas(struct iwl_fw_runtime *fwrt,
+ 		     __le32 *block_list_array,
+@@ -707,49 +710,103 @@ int iwl_sar_get_wgds_table(struct iwl_fw_runtime *fwrt)
+ {
+ 	union acpi_object *wifi_pkg, *data;
+ 	int i, j, k, ret, tbl_rev;
+-	int idx = 1; /* start from one to skip the domain */
+-	u8 num_bands;
++	u8 num_bands, num_profiles;
++	static const struct {
++		u8 revisions;
++		u8 bands;
++		u8 profiles;
++		u8 min_profiles;
++	} rev_data[] = {
++		{
++			.revisions = BIT(3),
++			.bands = ACPI_GEO_NUM_BANDS_REV2,
++			.profiles = ACPI_NUM_GEO_PROFILES_REV3,
++			.min_profiles = 3,
++		},
++		{
++			.revisions = BIT(2),
++			.bands = ACPI_GEO_NUM_BANDS_REV2,
++			.profiles = ACPI_NUM_GEO_PROFILES,
++		},
++		{
++			.revisions = BIT(0) | BIT(1),
++			.bands = ACPI_GEO_NUM_BANDS_REV0,
++			.profiles = ACPI_NUM_GEO_PROFILES,
++		},
++	};
++	int idx;
++	/* start from one to skip the domain */
++	int entry_idx = 1;
++
++	BUILD_BUG_ON(ACPI_NUM_GEO_PROFILES_REV3 != IWL_NUM_GEO_PROFILES_V3);
++	BUILD_BUG_ON(ACPI_NUM_GEO_PROFILES != IWL_NUM_GEO_PROFILES);
+ 
+ 	data = iwl_acpi_get_object(fwrt->dev, ACPI_WGDS_METHOD);
+ 	if (IS_ERR(data))
+ 		return PTR_ERR(data);
+ 
+-	/* start by trying to read revision 2 */
+-	wifi_pkg = iwl_acpi_get_wifi_pkg(fwrt->dev, data,
+-					 ACPI_WGDS_WIFI_DATA_SIZE_REV2,
+-					 &tbl_rev);
+-	if (!IS_ERR(wifi_pkg)) {
+-		if (tbl_rev != 2) {
+-			ret = PTR_ERR(wifi_pkg);
+-			goto out_free;
+-		}
+-
+-		num_bands = ACPI_GEO_NUM_BANDS_REV2;
+-
+-		goto read_table;
+-	}
+-
+-	/* then try revision 0 (which is the same as 1) */
+-	wifi_pkg = iwl_acpi_get_wifi_pkg(fwrt->dev, data,
+-					 ACPI_WGDS_WIFI_DATA_SIZE_REV0,
+-					 &tbl_rev);
+-	if (!IS_ERR(wifi_pkg)) {
+-		if (tbl_rev != 0 && tbl_rev != 1) {
+-			ret = PTR_ERR(wifi_pkg);
+-			goto out_free;
++	/* read the highest revision we understand first */
++	for (idx = 0; idx < ARRAY_SIZE(rev_data); idx++) {
++		/* min_profiles != 0 requires num_profiles header */
++		u32 hdr_size = 1 + !!rev_data[idx].min_profiles;
++		u32 profile_size = ACPI_GEO_PER_CHAIN_SIZE *
++				   rev_data[idx].bands;
++		u32 max_size = hdr_size + profile_size * rev_data[idx].profiles;
++		u32 min_size;
++
++		if (!rev_data[idx].min_profiles)
++			min_size = max_size;
++		else
++			min_size = hdr_size +
++				   profile_size * rev_data[idx].min_profiles;
++
++		wifi_pkg = iwl_acpi_get_wifi_pkg_range(fwrt->dev, data,
++						       min_size, max_size,
++						       &tbl_rev);
++		if (!IS_ERR(wifi_pkg)) {
++			if (!(BIT(tbl_rev) & rev_data[idx].revisions))
++				continue;
++
++			num_bands = rev_data[idx].bands;
++			num_profiles = rev_data[idx].profiles;
++
++			if (rev_data[idx].min_profiles) {
++				/* read header that says # of profiles */
++				union acpi_object *entry;
++
++				entry = &wifi_pkg->package.elements[entry_idx];
++				entry_idx++;
++				if (entry->type != ACPI_TYPE_INTEGER ||
++				    entry->integer.value > num_profiles) {
++					ret = -EINVAL;
++					goto out_free;
++				}
++				num_profiles = entry->integer.value;
++
++				/*
++				 * this also validates >= min_profiles since we
++				 * otherwise wouldn't have gotten the data when
++				 * looking up in ACPI
++				 */
++				if (wifi_pkg->package.count !=
++				    min_size + profile_size * num_profiles) {
++					ret = -EINVAL;
++					goto out_free;
++				}
++			}
++			goto read_table;
+ 		}
+-
+-		num_bands = ACPI_GEO_NUM_BANDS_REV0;
+-
+-		goto read_table;
+ 	}
+ 
+-	ret = PTR_ERR(wifi_pkg);
++	if (idx < ARRAY_SIZE(rev_data))
++		ret = PTR_ERR(wifi_pkg);
++	else
++		ret = -ENOENT;
+ 	goto out_free;
+ 
+ read_table:
+ 	fwrt->geo_rev = tbl_rev;
+-	for (i = 0; i < ACPI_NUM_GEO_PROFILES; i++) {
++	for (i = 0; i < num_profiles; i++) {
+ 		for (j = 0; j < ACPI_GEO_NUM_BANDS_REV2; j++) {
+ 			union acpi_object *entry;
+ 
+@@ -762,7 +819,8 @@ int iwl_sar_get_wgds_table(struct iwl_fw_runtime *fwrt)
+ 				fwrt->geo_profiles[i].bands[j].max =
+ 					fwrt->geo_profiles[i].bands[1].max;
+ 			} else {
+-				entry = &wifi_pkg->package.elements[idx++];
++				entry = &wifi_pkg->package.elements[entry_idx];
++				entry_idx++;
+ 				if (entry->type != ACPI_TYPE_INTEGER ||
+ 				    entry->integer.value > U8_MAX) {
+ 					ret = -EINVAL;
+@@ -779,7 +837,8 @@ int iwl_sar_get_wgds_table(struct iwl_fw_runtime *fwrt)
+ 					fwrt->geo_profiles[i].bands[j].chains[k] =
+ 						fwrt->geo_profiles[i].bands[1].chains[k];
+ 				} else {
+-					entry = &wifi_pkg->package.elements[idx++];
++					entry = &wifi_pkg->package.elements[entry_idx];
++					entry_idx++;
+ 					if (entry->type != ACPI_TYPE_INTEGER ||
+ 					    entry->integer.value > U8_MAX) {
+ 						ret = -EINVAL;
+@@ -803,10 +862,10 @@ IWL_EXPORT_SYMBOL(iwl_sar_get_wgds_table);
+ bool iwl_sar_geo_support(struct iwl_fw_runtime *fwrt)
+ {
+ 	/*
+-	 * The GEO_TX_POWER_LIMIT command is not supported on earlier
+-	 * firmware versions.  Unfortunately, we don't have a TLV API
+-	 * flag to rely on, so rely on the major version which is in
+-	 * the first byte of ucode_ver.  This was implemented
++	 * The PER_CHAIN_LIMIT_OFFSET_CMD command is not supported on
++	 * earlier firmware versions.  Unfortunately, we don't have a
++	 * TLV API flag to rely on, so rely on the major version which
++	 * is in the first byte of ucode_ver.  This was implemented
+ 	 * initially on version 38 and then backported to 17.  It was
+ 	 * also backported to 29, but only for 7265D devices.  The
+ 	 * intention was to have it in 36 as well, but not all 8000
+@@ -823,14 +882,15 @@ bool iwl_sar_geo_support(struct iwl_fw_runtime *fwrt)
+ IWL_EXPORT_SYMBOL(iwl_sar_geo_support);
+ 
+ int iwl_sar_geo_init(struct iwl_fw_runtime *fwrt,
+-		     struct iwl_per_chain_offset *table, u32 n_bands)
++		     struct iwl_per_chain_offset *table,
++		     u32 n_bands, u32 n_profiles)
+ {
+ 	int i, j;
+ 
+ 	if (!iwl_sar_geo_support(fwrt))
+ 		return -EOPNOTSUPP;
+ 
+-	for (i = 0; i < ACPI_NUM_GEO_PROFILES; i++) {
++	for (i = 0; i < n_profiles; i++) {
+ 		for (j = 0; j < n_bands; j++) {
+ 			struct iwl_per_chain_offset *chain =
+ 				&table[i * n_bands + j];
+diff --git a/drivers/net/wireless/intel/iwlwifi/fw/acpi.h b/drivers/net/wireless/intel/iwlwifi/fw/acpi.h
+index 16ed0995b..4aaa8a6b0 100644
+--- a/drivers/net/wireless/intel/iwlwifi/fw/acpi.h
++++ b/drivers/net/wireless/intel/iwlwifi/fw/acpi.h
+@@ -29,6 +29,7 @@
+ #define ACPI_SAR_PROFILE_NUM		4
+ 
+ #define ACPI_NUM_GEO_PROFILES		3
++#define ACPI_NUM_GEO_PROFILES_REV3	8
+ #define ACPI_GEO_PER_CHAIN_SIZE		3
+ 
+ #define ACPI_SAR_NUM_CHAINS_REV0	2
+@@ -59,13 +60,6 @@
+ #define ACPI_GEO_NUM_BANDS_REV2		3
+ #define ACPI_GEO_NUM_CHAINS		2
+ 
+-#define ACPI_WGDS_WIFI_DATA_SIZE_REV0	(ACPI_NUM_GEO_PROFILES *   \
+-					 ACPI_GEO_NUM_BANDS_REV0 * \
+-					 ACPI_GEO_PER_CHAIN_SIZE + 1)
+-#define ACPI_WGDS_WIFI_DATA_SIZE_REV2	(ACPI_NUM_GEO_PROFILES *   \
+-					 ACPI_GEO_NUM_BANDS_REV2 * \
+-					 ACPI_GEO_PER_CHAIN_SIZE + 1)
+-
+ #define ACPI_WRDD_WIFI_DATA_SIZE	2
+ #define ACPI_SPLC_WIFI_DATA_SIZE	2
+ #define ACPI_ECKV_WIFI_DATA_SIZE	2
+@@ -115,8 +109,10 @@ enum iwl_dsm_funcs_rev_0 {
+ 	DSM_FUNC_QUERY = 0,
+ 	DSM_FUNC_DISABLE_SRD = 1,
+ 	DSM_FUNC_ENABLE_INDONESIA_5G2 = 2,
++	DSM_FUNC_ENABLE_6E = 3,
+ 	DSM_FUNC_11AX_ENABLEMENT = 6,
+-	DSM_FUNC_ENABLE_UNII4_CHAN = 7
++	DSM_FUNC_ENABLE_UNII4_CHAN = 7,
++	DSM_FUNC_ACTIVATE_CHANNEL = 8
+ };
+ 
+ enum iwl_dsm_values_srd {
+@@ -158,10 +154,11 @@ int iwl_acpi_get_dsm_u8(struct device *dev, int rev, int func,
+ int iwl_acpi_get_dsm_u32(struct device *dev, int rev, int func,
+ 			 const guid_t *guid, u32 *value);
+ 
+-union acpi_object *iwl_acpi_get_wifi_pkg(struct device *dev,
+-					 union acpi_object *data,
+-					 int data_size, int *tbl_rev);
+-
++union acpi_object *iwl_acpi_get_wifi_pkg_range(struct device *dev,
++					       union acpi_object *data,
++					       int min_data_size,
++					       int max_data_size,
++					       int *tbl_rev);
+ /**
+  * iwl_acpi_get_mcc - read MCC from ACPI, if available
+  *
+@@ -198,7 +195,8 @@ int iwl_sar_get_wgds_table(struct iwl_fw_runtime *fwrt);
+ bool iwl_sar_geo_support(struct iwl_fw_runtime *fwrt);
+ 
+ int iwl_sar_geo_init(struct iwl_fw_runtime *fwrt,
+-		     struct iwl_per_chain_offset *table, u32 n_bands);
++		     struct iwl_per_chain_offset *table,
++		     u32 n_bands, u32 n_profiles);
+ 
+ int iwl_acpi_get_tas(struct iwl_fw_runtime *fwrt, __le32 *block_list_array,
+ 		     int *block_list_size);
+@@ -230,10 +228,11 @@ static inline int iwl_acpi_get_dsm_u32(struct device *dev, int rev, int func,
+ 	return -ENOENT;
+ }
+ 
+-static inline union acpi_object *iwl_acpi_get_wifi_pkg(struct device *dev,
+-						       union acpi_object *data,
+-						       int data_size,
+-						       int *tbl_rev)
++static inline union acpi_object *
++iwl_acpi_get_wifi_pkg_range(struct device *dev,
++			    union acpi_object *data,
++			    int min_data_size, int max_data_size,
++			    int *tbl_rev)
+ {
+ 	return ERR_PTR(-ENOENT);
+ }
+@@ -293,4 +292,14 @@ static inline __le32 iwl_acpi_get_lari_config_bitmap(struct iwl_fw_runtime *fwrt
+ }
+ 
+ #endif /* CONFIG_ACPI */
++
++static inline union acpi_object *
++iwl_acpi_get_wifi_pkg(struct device *dev,
++		      union acpi_object *data,
++		      int data_size, int *tbl_rev)
++{
++	return iwl_acpi_get_wifi_pkg_range(dev, data, data_size, data_size,
++					   tbl_rev);
++}
++
+ #endif /* __iwl_fw_acpi__ */
+diff --git a/drivers/net/wireless/intel/iwlwifi/fw/api/d3.h b/drivers/net/wireless/intel/iwlwifi/fw/api/d3.h
+index 3ec82cae3..689cd8cbf 100644
+--- a/drivers/net/wireless/intel/iwlwifi/fw/api/d3.h
++++ b/drivers/net/wireless/intel/iwlwifi/fw/api/d3.h
+@@ -693,49 +693,6 @@ struct iwl_wowlan_status_v9 {
+ 	u8 wake_packet[]; /* can be truncated from _length to _bufsize */
+ } __packed; /* WOWLAN_STATUSES_RSP_API_S_VER_9 */
+ 
+-/**
+- * struct iwl_wowlan_status - WoWLAN status
+- * @gtk: GTK data
+- * @igtk: IGTK data
+- * @bigtk: BIGTK data
+- * @replay_ctr: GTK rekey replay counter
+- * @pattern_number: number of the matched pattern
+- * @non_qos_seq_ctr: non-QoS sequence counter to use next
+- * @qos_seq_ctr: QoS sequence counters to use next
+- * @wakeup_reasons: wakeup reasons, see &enum iwl_wowlan_wakeup_reason
+- * @num_of_gtk_rekeys: number of GTK rekeys
+- * @tid_tear_down: bitmap of TIDs torn down
+- * @reserved: reserved
+- * @received_beacons: number of received beacons
+- * @wake_packet_length: wakeup packet length
+- * @wake_packet_bufsize: wakeup packet buffer size
+- * @tid_tear_down: bit mask of tids whose BA sessions were closed
+- *		   in suspend state
+- * @wake_packet: wakeup packet
+- */
+-struct iwl_wowlan_status {
+-	struct iwl_wowlan_gtk_status gtk[1];
+-	struct iwl_wowlan_igtk_status igtk[1];
+-	struct iwl_wowlan_igtk_status bigtk[WOWLAN_IGTK_KEYS_NUM];
+-	__le64 replay_ctr;
+-	__le16 pattern_number;
+-	__le16 non_qos_seq_ctr;
+-	__le16 qos_seq_ctr[8];
+-	__le32 wakeup_reasons;
+-	__le32 num_of_gtk_rekeys;
+-	u8 tid_tear_down;
+-	u8 reserved[3];
+-	__le32 received_beacons;
+-	__le32 wake_packet_length;
+-	__le32 wake_packet_bufsize;
+-	u8 wake_packet[]; /* can be truncated from _length to _bufsize */
+-} __packed; /* WOWLAN_STATUSES_API_S_VER_11 */
+-
+-static inline u8 iwlmvm_wowlan_gtk_idx(struct iwl_wowlan_gtk_status *gtk)
+-{
+-	return gtk->key_flags & IWL_WOWLAN_GTK_IDX_MASK;
+-}
+-
+ /* TODO: NetDetect API */
+ 
+ #endif /* __iwl_fw_api_d3_h__ */
+diff --git a/drivers/net/wireless/intel/iwlwifi/fw/api/dbg-tlv.h b/drivers/net/wireless/intel/iwlwifi/fw/api/dbg-tlv.h
+index d8b5870d6..fd88d3a00 100644
+--- a/drivers/net/wireless/intel/iwlwifi/fw/api/dbg-tlv.h
++++ b/drivers/net/wireless/intel/iwlwifi/fw/api/dbg-tlv.h
+@@ -242,6 +242,62 @@ struct iwl_fw_ini_hcmd_tlv {
+ 	struct iwl_fw_ini_hcmd hcmd;
+ } __packed; /* FW_TLV_DEBUG_HCMD_API_S_VER_1 */
+ 
++/**
++* struct iwl_fw_ini_conf_tlv - preset configuration TLV
++*
++* @address: the base address
++* @value: value to set at address
++
++*/
++struct iwl_fw_ini_addr_val {
++	__le32 address;
++	__le32 value;
++} __packed; /* FW_TLV_DEBUG_ADDR_VALUE_VER_1 */
++
++/**
++ * struct iwl_fw_ini_conf_tlv - configuration TLV to set register/memory.
++ *
++ * @hdr: debug header
++ * @time_point: time point to apply config. One of &enum iwl_fw_ini_time_point
++ * @set_type: write access type preset token for time point.
++ *  one of &enum iwl_fw_ini_config_set_type
++ * @addr_offset: the offset to add to any item in address[0] field
++ * @addr_val: address value pair
++ */
++struct iwl_fw_ini_conf_set_tlv {
++	struct iwl_fw_ini_header hdr;
++	__le32 time_point;
++	__le32 set_type;
++	__le32 addr_offset;
++	struct iwl_fw_ini_addr_val addr_val[0];
++} __packed; /* FW_TLV_DEBUG_CONFIG_SET_API_S_VER_1 */
++
++/**
++ * enum iwl_fw_ini_config_set_type
++ *
++ * @IWL_FW_INI_CONFIG_SET_TYPE_INVALID: invalid config set
++ * @IWL_FW_INI_CONFIG_SET_TYPE_DEVICE_PERIPHERY_MAC: for PERIPHERY MAC configuration
++ * @IWL_FW_INI_CONFIG_SET_TYPE_DEVICE_PERIPHERY_PHY: for PERIPHERY PHY configuration
++ * @IWL_FW_INI_CONFIG_SET_TYPE_DEVICE_PERIPHERY_AUX: for PERIPHERY AUX configuration
++ * @IWL_FW_INI_CONFIG_SET_TYPE_DEVICE_MEMORY: for DEVICE MEMORY configuration
++ * @IWL_FW_INI_CONFIG_SET_TYPE_CSR: for CSR configuration
++ * @IWL_FW_INI_CONFIG_SET_TYPE_DBGC_DRAM_ADDR: for DBGC_DRAM_ADDR configuration
++ * @IWL_FW_INI_CONFIG_SET_TYPE_PERIPH_SCRATCH_HWM: for PERIPH SCRATCH HWM configuration
++ * @IWL_FW_INI_ALLOCATION_NUM: max number of configuration supported
++*/
++
++enum iwl_fw_ini_config_set_type {
++	IWL_FW_INI_CONFIG_SET_TYPE_INVALID = 0,
++	IWL_FW_INI_CONFIG_SET_TYPE_DEVICE_PERIPHERY_MAC,
++	IWL_FW_INI_CONFIG_SET_TYPE_DEVICE_PERIPHERY_PHY,
++	IWL_FW_INI_CONFIG_SET_TYPE_DEVICE_PERIPHERY_AUX,
++	IWL_FW_INI_CONFIG_SET_TYPE_DEVICE_MEMORY,
++	IWL_FW_INI_CONFIG_SET_TYPE_CSR,
++	IWL_FW_INI_CONFIG_SET_TYPE_DBGC_DRAM_ADDR,
++	IWL_FW_INI_CONFIG_SET_TYPE_PERIPH_SCRATCH_HWM,
++	IWL_FW_INI_CONFIG_SET_TYPE_MAX_NUM,
++} __packed;
++
+ /**
+  * enum iwl_fw_ini_allocation_id
+  *
+diff --git a/drivers/net/wireless/intel/iwlwifi/fw/api/debug.h b/drivers/net/wireless/intel/iwlwifi/fw/api/debug.h
+index 8adccd5da..029ae64bf 100644
+--- a/drivers/net/wireless/intel/iwlwifi/fw/api/debug.h
++++ b/drivers/net/wireless/intel/iwlwifi/fw/api/debug.h
+@@ -361,6 +361,41 @@ struct iwl_buf_alloc_cmd {
+ 	struct iwl_buf_alloc_frag frags[BUF_ALLOC_MAX_NUM_FRAGS];
+ } __packed; /* BUFFER_ALLOCATION_CMD_API_S_VER_2 */
+ 
++#define DRAM_INFO_FIRST_MAGIC_WORD 0x76543210
++#define DRAM_INFO_SECOND_MAGIC_WORD 0x89ABCDEF
++
++/**
++ * struct iwL_dram_info - DRAM fragments allocation struct
++ *
++ * Driver will fill in the first 1K(+) of the pointed DRAM fragment
++ *
++ * @first_word: magic word value
++ * @second_word: magic word value
++ * @framfrags: DRAM fragmentaion detail
++*/
++struct iwl_dram_info {
++	__le32 first_word;
++	__le32 second_word;
++	struct iwl_buf_alloc_cmd dram_frags[IWL_FW_INI_ALLOCATION_NUM - 1];
++} __packed; /* INIT_DRAM_FRAGS_ALLOCATIONS_S_VER_1 */
++
++/**
++ * struct iwl_dbgc1_info - DBGC1 address and size
++ *
++ * Driver will fill the dbcg1 address and size at address based on config TLV.
++ *
++ * @first_word: all 0 set as identifier
++ * @dbgc1_add_lsb: LSB bits of DBGC1 physical address
++ * @dbgc1_add_msb: MSB bits of DBGC1 physical address
++ * @dbgc1_size: DBGC1 size
++*/
++struct iwl_dbgc1_info {
++	__le32 first_word;
++	__le32 dbgc1_add_lsb;
++	__le32 dbgc1_add_msb;
++	__le32 dbgc1_size;
++} __packed; /* INIT_DRAM_FRAGS_ALLOCATIONS_S_VER_1 */
++
+ /**
+  * struct iwl_dbg_host_event_cfg_cmd
+  * @enabled_severities: enabled severities
+diff --git a/drivers/net/wireless/intel/iwlwifi/fw/api/mac-cfg.h b/drivers/net/wireless/intel/iwlwifi/fw/api/mac-cfg.h
+index 6610d1234..d088c820b 100644
+--- a/drivers/net/wireless/intel/iwlwifi/fw/api/mac-cfg.h
++++ b/drivers/net/wireless/intel/iwlwifi/fw/api/mac-cfg.h
+@@ -1,6 +1,6 @@
+ /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
+ /*
+- * Copyright (C) 2012-2014, 2018-2019 Intel Corporation
++ * Copyright (C) 2012-2014, 2018-2019, 2021 Intel Corporation
+  * Copyright (C) 2013-2015 Intel Mobile Communications GmbH
+  * Copyright (C) 2016-2017 Intel Deutschland GmbH
+  */
+@@ -39,9 +39,9 @@ enum iwl_mac_conf_subcmd_ids {
+ 	PROBE_RESPONSE_DATA_NOTIF = 0xFC,
+ 
+ 	/**
+-	 * @CHANNEL_SWITCH_NOA_NOTIF: &struct iwl_channel_switch_noa_notif
++	 * @CHANNEL_SWITCH_START_NOTIF: &struct iwl_channel_switch_start_notif
+ 	 */
+-	CHANNEL_SWITCH_NOA_NOTIF = 0xFF,
++	CHANNEL_SWITCH_START_NOTIF = 0xFF,
+ };
+ 
+ #define IWL_P2P_NOA_DESC_COUNT	(2)
+@@ -102,11 +102,11 @@ struct iwl_missed_vap_notif {
+ } __packed; /* MISSED_VAP_NTFY_API_S_VER_1 */
+ 
+ /**
+- * struct iwl_channel_switch_noa_notif - Channel switch NOA notification
++ * struct iwl_channel_switch_start_notif - Channel switch start notification
+  *
+  * @id_and_color: ID and color of the MAC
+  */
+-struct iwl_channel_switch_noa_notif {
++struct iwl_channel_switch_start_notif {
+ 	__le32 id_and_color;
+ } __packed; /* CHANNEL_SWITCH_START_NTFY_API_S_VER_1 */
+ 
+diff --git a/drivers/net/wireless/intel/iwlwifi/fw/api/mac.h b/drivers/net/wireless/intel/iwlwifi/fw/api/mac.h
+index 7be7715b4..11f0bd283 100644
+--- a/drivers/net/wireless/intel/iwlwifi/fw/api/mac.h
++++ b/drivers/net/wireless/intel/iwlwifi/fw/api/mac.h
+@@ -138,6 +138,8 @@ struct iwl_mac_data_ibss {
+  * @FLEXIBLE_TWT_SUPPORTED: AP supports flexible TWT schedule
+  * @PROTECTED_TWT_SUPPORTED: AP supports protected TWT frames (with 11w)
+  * @BROADCAST_TWT_SUPPORTED: AP and STA support broadcast TWT
++ * @COEX_HIGH_PRIORITY_ENABLE: high priority mode for BT coex, to be used
++ *	during 802.1X negotiation (and allowed during 4-way-HS)
+  */
+ enum iwl_mac_data_policy {
+ 	TWT_SUPPORTED = BIT(0),
+@@ -145,6 +147,7 @@ enum iwl_mac_data_policy {
+ 	FLEXIBLE_TWT_SUPPORTED = BIT(2),
+ 	PROTECTED_TWT_SUPPORTED = BIT(3),
+ 	BROADCAST_TWT_SUPPORTED = BIT(4),
++	COEX_HIGH_PRIORITY_ENABLE = BIT(5),
+ };
+ 
+ /**
+diff --git a/drivers/net/wireless/intel/iwlwifi/fw/api/nvm-reg.h b/drivers/net/wireless/intel/iwlwifi/fw/api/nvm-reg.h
+index cf48c6fa8..3551a3f1c 100644
+--- a/drivers/net/wireless/intel/iwlwifi/fw/api/nvm-reg.h
++++ b/drivers/net/wireless/intel/iwlwifi/fw/api/nvm-reg.h
+@@ -471,6 +471,29 @@ struct iwl_lari_config_change_cmd_v4 {
+ 	__le32 oem_unii4_allow_bitmap;
+ } __packed; /* LARI_CHANGE_CONF_CMD_S_VER_4 */
+ 
++/**
++ * struct iwl_lari_config_change_cmd_v5 - change LARI configuration
++ * @config_bitmap: Bitmap of the config commands. Each bit will trigger a
++ *     different predefined FW config operation.
++ * @oem_uhb_allow_bitmap: Bitmap of UHB enabled MCC sets.
++ * @oem_11ax_allow_bitmap: Bitmap of 11ax allowed MCCs. There are two bits
++ *     per country, one to indicate whether to override and the other to
++ *     indicate the value to use.
++ * @oem_unii4_allow_bitmap: Bitmap of unii4 allowed MCCs.There are two bits
++ *     per country, one to indicate whether to override and the other to
++ *     indicate allow/disallow unii4 channels.
++ * @chan_state_active_bitmap: Bitmap for overriding channel state to active.
++ *     Each bit represents a country or region to activate, according to the BIOS
++ *     definitions.
++ */
++struct iwl_lari_config_change_cmd_v5 {
++	__le32 config_bitmap;
++	__le32 oem_uhb_allow_bitmap;
++	__le32 oem_11ax_allow_bitmap;
++	__le32 oem_unii4_allow_bitmap;
++	__le32 chan_state_active_bitmap;
++} __packed; /* LARI_CHANGE_CONF_CMD_S_VER_5 */
++
+ /**
+  * struct iwl_pnvm_init_complete_ntfy - PNVM initialization complete
+  * @status: PNVM image loading status
+diff --git a/drivers/net/wireless/intel/iwlwifi/fw/api/phy.h b/drivers/net/wireless/intel/iwlwifi/fw/api/phy.h
+index d07a632f1..c04f2521f 100644
+--- a/drivers/net/wireless/intel/iwlwifi/fw/api/phy.h
++++ b/drivers/net/wireless/intel/iwlwifi/fw/api/phy.h
+@@ -1,6 +1,6 @@
+ /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
+ /*
+- * Copyright (C) 2012-2014, 2019-2020 Intel Corporation
++ * Copyright (C) 2012-2014, 2019-2021 Intel Corporation
+  * Copyright (C) 2013-2015 Intel Mobile Communications GmbH
+  * Copyright (C) 2016-2017 Intel Deutschland GmbH
+  */
+@@ -29,9 +29,9 @@ enum iwl_phy_ops_subcmd_ids {
+ 	TEMP_REPORTING_THRESHOLDS_CMD = 0x04,
+ 
+ 	/**
+-	 * @GEO_TX_POWER_LIMIT: &struct iwl_geo_tx_power_profiles_cmd
++	 * @PER_CHAIN_LIMIT_OFFSET_CMD: &struct iwl_geo_tx_power_profiles_cmd
+ 	 */
+-	GEO_TX_POWER_LIMIT = 0x05,
++	PER_CHAIN_LIMIT_OFFSET_CMD = 0x05,
+ 
+ 	/**
+ 	 * @PER_PLATFORM_ANT_GAIN_CMD: &struct iwl_ppag_table_cmd
+diff --git a/drivers/net/wireless/intel/iwlwifi/fw/api/power.h b/drivers/net/wireless/intel/iwlwifi/fw/api/power.h
+index 86445385f..4d671c878 100644
+--- a/drivers/net/wireless/intel/iwlwifi/fw/api/power.h
++++ b/drivers/net/wireless/intel/iwlwifi/fw/api/power.h
+@@ -1,6 +1,6 @@
+ /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
+ /*
+- * Copyright (C) 2012-2014, 2018-2020 Intel Corporation
++ * Copyright (C) 2012-2014, 2018-2021 Intel Corporation
+  * Copyright (C) 2013-2014 Intel Mobile Communications GmbH
+  * Copyright (C) 2015-2017 Intel Deutschland GmbH
+  */
+@@ -378,9 +378,10 @@ struct iwl_dev_tx_power_cmd {
+ 	};
+ };
+ 
+-#define IWL_NUM_GEO_PROFILES   3
+-#define IWL_NUM_BANDS_PER_CHAIN_V1 2
+-#define IWL_NUM_BANDS_PER_CHAIN_V2 3
++#define IWL_NUM_GEO_PROFILES		3
++#define IWL_NUM_GEO_PROFILES_V3		8
++#define IWL_NUM_BANDS_PER_CHAIN_V1	2
++#define IWL_NUM_BANDS_PER_CHAIN_V2	3
+ 
+ /**
+  * enum iwl_geo_per_chain_offset_operation - type of operation
+@@ -390,10 +391,10 @@ struct iwl_dev_tx_power_cmd {
+ enum iwl_geo_per_chain_offset_operation {
+ 	IWL_PER_CHAIN_OFFSET_SET_TABLES,
+ 	IWL_PER_CHAIN_OFFSET_GET_CURRENT_TABLE,
+-};  /* GEO_TX_POWER_LIMIT FLAGS TYPE */
++};  /* PER_CHAIN_OFFSET_OPERATION_E */
+ 
+ /**
+- * struct iwl_per_chain_offset - embedded struct for GEO_TX_POWER_LIMIT.
++ * struct iwl_per_chain_offset - embedded struct for PER_CHAIN_LIMIT_OFFSET_CMD.
+  * @max_tx_power: maximum allowed tx power.
+  * @chain_a: tx power offset for chain a.
+  * @chain_b: tx power offset for chain b.
+@@ -405,17 +406,17 @@ struct iwl_per_chain_offset {
+ } __packed; /* PER_CHAIN_LIMIT_OFFSET_PER_CHAIN_S_VER_1 */
+ 
+ /**
+- * struct iwl_geo_tx_power_profile_cmd_v1 - struct for GEO_TX_POWER_LIMIT cmd.
++ * struct iwl_geo_tx_power_profile_cmd_v1 - struct for PER_CHAIN_LIMIT_OFFSET_CMD cmd.
+  * @ops: operations, value from &enum iwl_geo_per_chain_offset_operation
+  * @table: offset profile per band.
+  */
+ struct iwl_geo_tx_power_profiles_cmd_v1 {
+ 	__le32 ops;
+ 	struct iwl_per_chain_offset table[IWL_NUM_GEO_PROFILES][IWL_NUM_BANDS_PER_CHAIN_V1];
+-} __packed; /* GEO_TX_POWER_LIMIT_VER_1 */
++} __packed; /* PER_CHAIN_LIMIT_OFFSET_CMD_VER_1 */
+ 
+ /**
+- * struct iwl_geo_tx_power_profile_cmd_v2 - struct for GEO_TX_POWER_LIMIT cmd.
++ * struct iwl_geo_tx_power_profile_cmd_v2 - struct for PER_CHAIN_LIMIT_OFFSET_CMD cmd.
+  * @ops: operations, value from &enum iwl_geo_per_chain_offset_operation
+  * @table: offset profile per band.
+  * @table_revision: BIOS table revision.
+@@ -424,10 +425,10 @@ struct iwl_geo_tx_power_profiles_cmd_v2 {
+ 	__le32 ops;
+ 	struct iwl_per_chain_offset table[IWL_NUM_GEO_PROFILES][IWL_NUM_BANDS_PER_CHAIN_V1];
+ 	__le32 table_revision;
+-} __packed; /* GEO_TX_POWER_LIMIT_VER_2 */
++} __packed; /* PER_CHAIN_LIMIT_OFFSET_CMD_VER_2 */
+ 
+ /**
+- * struct iwl_geo_tx_power_profile_cmd_v3 - struct for GEO_TX_POWER_LIMIT cmd.
++ * struct iwl_geo_tx_power_profile_cmd_v3 - struct for PER_CHAIN_LIMIT_OFFSET_CMD cmd.
+  * @ops: operations, value from &enum iwl_geo_per_chain_offset_operation
+  * @table: offset profile per band.
+  * @table_revision: BIOS table revision.
+@@ -436,21 +437,47 @@ struct iwl_geo_tx_power_profiles_cmd_v3 {
+ 	__le32 ops;
+ 	struct iwl_per_chain_offset table[IWL_NUM_GEO_PROFILES][IWL_NUM_BANDS_PER_CHAIN_V2];
+ 	__le32 table_revision;
+-} __packed; /* GEO_TX_POWER_LIMIT_VER_3 */
++} __packed; /* PER_CHAIN_LIMIT_OFFSET_CMD_VER_3 */
++
++/**
++ * struct iwl_geo_tx_power_profile_cmd_v4 - struct for PER_CHAIN_LIMIT_OFFSET_CMD cmd.
++ * @ops: operations, value from &enum iwl_geo_per_chain_offset_operation
++ * @table: offset profile per band.
++ * @table_revision: BIOS table revision.
++ */
++struct iwl_geo_tx_power_profiles_cmd_v4 {
++	__le32 ops;
++	struct iwl_per_chain_offset table[IWL_NUM_GEO_PROFILES_V3][IWL_NUM_BANDS_PER_CHAIN_V1];
++	__le32 table_revision;
++} __packed; /* PER_CHAIN_LIMIT_OFFSET_CMD_VER_4 */
++
++/**
++ * struct iwl_geo_tx_power_profile_cmd_v5 - struct for PER_CHAIN_LIMIT_OFFSET_CMD cmd.
++ * @ops: operations, value from &enum iwl_geo_per_chain_offset_operation
++ * @table: offset profile per band.
++ * @table_revision: BIOS table revision.
++ */
++struct iwl_geo_tx_power_profiles_cmd_v5 {
++	__le32 ops;
++	struct iwl_per_chain_offset table[IWL_NUM_GEO_PROFILES_V3][IWL_NUM_BANDS_PER_CHAIN_V2];
++	__le32 table_revision;
++} __packed; /* PER_CHAIN_LIMIT_OFFSET_CMD_VER_5 */
+ 
+ union iwl_geo_tx_power_profiles_cmd {
+ 	struct iwl_geo_tx_power_profiles_cmd_v1 v1;
+ 	struct iwl_geo_tx_power_profiles_cmd_v2 v2;
+ 	struct iwl_geo_tx_power_profiles_cmd_v3 v3;
++	struct iwl_geo_tx_power_profiles_cmd_v4 v4;
++	struct iwl_geo_tx_power_profiles_cmd_v5 v5;
+ };
+ 
+ /**
+- * struct iwl_geo_tx_power_profiles_resp -  response to GEO_TX_POWER_LIMIT cmd
++ * struct iwl_geo_tx_power_profiles_resp -  response to PER_CHAIN_LIMIT_OFFSET_CMD cmd
+  * @profile_idx: current geo profile in use
+  */
+ struct iwl_geo_tx_power_profiles_resp {
+ 	__le32 profile_idx;
+-} __packed; /* GEO_TX_POWER_LIMIT_RESP */
++} __packed; /* PER_CHAIN_LIMIT_OFFSET_RSP */
+ 
+ /**
+  * union iwl_ppag_table_cmd - union for all versions of PPAG command
+diff --git a/drivers/net/wireless/intel/iwlwifi/fw/file.h b/drivers/net/wireless/intel/iwlwifi/fw/file.h
+index 6c8e9f3a6..d52c2da78 100644
+--- a/drivers/net/wireless/intel/iwlwifi/fw/file.h
++++ b/drivers/net/wireless/intel/iwlwifi/fw/file.h
+@@ -107,6 +107,7 @@ enum iwl_ucode_tlv_type {
+ 	IWL_UCODE_TLV_TYPE_HCMD			= IWL_UCODE_TLV_DEBUG_BASE + 2,
+ 	IWL_UCODE_TLV_TYPE_REGIONS		= IWL_UCODE_TLV_DEBUG_BASE + 3,
+ 	IWL_UCODE_TLV_TYPE_TRIGGERS		= IWL_UCODE_TLV_DEBUG_BASE + 4,
++	IWL_UCODE_TLV_TYPE_CONF_SET		= IWL_UCODE_TLV_DEBUG_BASE + 5,
+ 	IWL_UCODE_TLV_DEBUG_MAX = IWL_UCODE_TLV_TYPE_TRIGGERS,
+ 
+ 	/* TLVs 0x1000-0x2000 are for internal driver usage */
+@@ -416,6 +417,8 @@ enum iwl_ucode_tlv_capa {
+ 	IWL_UCODE_TLV_CAPA_PASSIVE_6GHZ_SCAN		= (__force iwl_ucode_tlv_capa_t)58,
+ 	IWL_UCODE_TLV_CAPA_HIDDEN_6GHZ_SCAN		= (__force iwl_ucode_tlv_capa_t)59,
+ 	IWL_UCODE_TLV_CAPA_BROADCAST_TWT		= (__force iwl_ucode_tlv_capa_t)60,
++	IWL_UCODE_TLV_CAPA_COEX_HIGH_PRIO		= (__force iwl_ucode_tlv_capa_t)61,
++	IWL_UCODE_TLV_CAPA_RFIM_SUPPORT			= (__force iwl_ucode_tlv_capa_t)62,
+ 
+ 	/* set 2 */
+ 	IWL_UCODE_TLV_CAPA_EXTENDED_DTS_MEASURE		= (__force iwl_ucode_tlv_capa_t)64,
+@@ -449,7 +452,7 @@ enum iwl_ucode_tlv_capa {
+ 	IWL_UCODE_TLV_CAPA_PSC_CHAN_SUPPORT		= (__force iwl_ucode_tlv_capa_t)98,
+ 
+ 	IWL_UCODE_TLV_CAPA_BIGTK_SUPPORT		= (__force iwl_ucode_tlv_capa_t)100,
+-	IWL_UCODE_TLV_CAPA_RFIM_SUPPORT			= (__force iwl_ucode_tlv_capa_t)102,
++	IWL_UCODE_TLV_CAPA_DRAM_FRAG_SUPPORT		= (__force iwl_ucode_tlv_capa_t)104,
+ 
+ #ifdef __CHECKER__
+ 	/* sparse says it cannot increment the previous enum member */
+diff --git a/drivers/net/wireless/intel/iwlwifi/fw/runtime.h b/drivers/net/wireless/intel/iwlwifi/fw/runtime.h
+index 35af85a54..6baabdf83 100644
+--- a/drivers/net/wireless/intel/iwlwifi/fw/runtime.h
++++ b/drivers/net/wireless/intel/iwlwifi/fw/runtime.h
+@@ -151,7 +151,7 @@ struct iwl_fw_runtime {
+ 	struct iwl_sar_profile sar_profiles[ACPI_SAR_PROFILE_NUM];
+ 	u8 sar_chain_a_profile;
+ 	u8 sar_chain_b_profile;
+-	struct iwl_geo_profile geo_profiles[ACPI_NUM_GEO_PROFILES];
++	struct iwl_geo_profile geo_profiles[ACPI_NUM_GEO_PROFILES_REV3];
+ 	u32 geo_rev;
+ 	union iwl_ppag_table_cmd ppag_table;
+ 	u32 ppag_ver;
+diff --git a/drivers/net/wireless/intel/iwlwifi/iwl-context-info-gen3.h b/drivers/net/wireless/intel/iwlwifi/iwl-context-info-gen3.h
+index e1fec23ac..5adf485db 100644
+--- a/drivers/net/wireless/intel/iwlwifi/iwl-context-info-gen3.h
++++ b/drivers/net/wireless/intel/iwlwifi/iwl-context-info-gen3.h
+@@ -109,12 +109,12 @@ struct iwl_prph_scratch_pnvm_cfg {
+  * struct iwl_prph_scratch_hwm_cfg - hwm config
+  * @hwm_base_addr: hwm start address
+  * @hwm_size: hwm size in DWs
+- * @reserved: reserved
++ * @debug_token_config: debug preset
+  */
+ struct iwl_prph_scratch_hwm_cfg {
+ 	__le64 hwm_base_addr;
+ 	__le32 hwm_size;
+-	__le32 reserved;
++	__le32 debug_token_config;
+ } __packed; /* PERIPH_SCRATCH_HWM_CFG_S */
+ 
+ /*
+diff --git a/drivers/net/wireless/intel/iwlwifi/iwl-dbg-tlv.c b/drivers/net/wireless/intel/iwlwifi/iwl-dbg-tlv.c
+index 8a610c518..d4ed2b175 100644
+--- a/drivers/net/wireless/intel/iwlwifi/iwl-dbg-tlv.c
++++ b/drivers/net/wireless/intel/iwlwifi/iwl-dbg-tlv.c
+@@ -16,6 +16,7 @@
+  * @IWL_DBG_TLV_TYPE_HCMD: host command TLV
+  * @IWL_DBG_TLV_TYPE_REGION: region TLV
+  * @IWL_DBG_TLV_TYPE_TRIGGER: trigger TLV
++ * @IWL_DBG_TLV_TYPE_CONF_SET: conf set TLV
+  * @IWL_DBG_TLV_TYPE_NUM: number of debug TLVs
+  */
+ enum iwl_dbg_tlv_type {
+@@ -25,6 +26,7 @@ enum iwl_dbg_tlv_type {
+ 	IWL_DBG_TLV_TYPE_HCMD,
+ 	IWL_DBG_TLV_TYPE_REGION,
+ 	IWL_DBG_TLV_TYPE_TRIGGER,
++	IWL_DBG_TLV_TYPE_CONF_SET,
+ 	IWL_DBG_TLV_TYPE_NUM,
+ };
+ 
+@@ -59,6 +61,7 @@ dbg_ver_table[IWL_DBG_TLV_TYPE_NUM] = {
+ 	[IWL_DBG_TLV_TYPE_HCMD]		= {.min_ver = 1, .max_ver = 1,},
+ 	[IWL_DBG_TLV_TYPE_REGION]	= {.min_ver = 1, .max_ver = 2,},
+ 	[IWL_DBG_TLV_TYPE_TRIGGER]	= {.min_ver = 1, .max_ver = 1,},
++	[IWL_DBG_TLV_TYPE_CONF_SET]	= {.min_ver = 1, .max_ver = 1,},
+ };
+ 
+ static int iwl_dbg_tlv_add(const struct iwl_ucode_tlv *tlv,
+@@ -266,6 +269,30 @@ static int iwl_dbg_tlv_alloc_trigger(struct iwl_trans *trans,
+ 	return ret;
+ }
+ 
++static int iwl_dbg_tlv_config_set(struct iwl_trans *trans,
++				  const struct iwl_ucode_tlv *tlv)
++{
++	struct iwl_fw_ini_conf_set_tlv *conf_set = (void *)tlv->data;
++	u32 tp = le32_to_cpu(conf_set->time_point);
++	u32 type = le32_to_cpu(conf_set->set_type);
++
++	if (tp <= IWL_FW_INI_TIME_POINT_INVALID ||
++	    tp >= IWL_FW_INI_TIME_POINT_NUM) {
++		IWL_DEBUG_FW(trans,
++			     "WRT: Invalid time point %u for config set TLV\n", tp);
++		return -EINVAL;
++	}
++
++	if (type <= IWL_FW_INI_CONFIG_SET_TYPE_INVALID ||
++	    type >= IWL_FW_INI_CONFIG_SET_TYPE_MAX_NUM) {
++		IWL_DEBUG_FW(trans,
++			     "WRT: Invalid config set type %u for config set TLV\n", type);
++		return -EINVAL;
++	}
++
++	return iwl_dbg_tlv_add(tlv, &trans->dbg.time_point[tp].config_list);
++}
++
+ static int (*dbg_tlv_alloc[])(struct iwl_trans *trans,
+ 			      const struct iwl_ucode_tlv *tlv) = {
+ 	[IWL_DBG_TLV_TYPE_DEBUG_INFO]	= iwl_dbg_tlv_alloc_debug_info,
+@@ -273,6 +300,7 @@ static int (*dbg_tlv_alloc[])(struct iwl_trans *trans,
+ 	[IWL_DBG_TLV_TYPE_HCMD]		= iwl_dbg_tlv_alloc_hcmd,
+ 	[IWL_DBG_TLV_TYPE_REGION]	= iwl_dbg_tlv_alloc_region,
+ 	[IWL_DBG_TLV_TYPE_TRIGGER]	= iwl_dbg_tlv_alloc_trigger,
++	[IWL_DBG_TLV_TYPE_CONF_SET]	= iwl_dbg_tlv_config_set,
+ };
+ 
+ void iwl_dbg_tlv_alloc(struct iwl_trans *trans, const struct iwl_ucode_tlv *tlv,
+@@ -405,6 +433,13 @@ void iwl_dbg_tlv_free(struct iwl_trans *trans)
+ 			list_del(&tlv_node->list);
+ 			kfree(tlv_node);
+ 		}
++
++		list_for_each_entry_safe(tlv_node, tlv_node_tmp,
++					 &tp->config_list, list) {
++			list_del(&tlv_node->list);
++			kfree(tlv_node);
++		}
++
+ 	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(trans->dbg.fw_mon_ini); i++)
+@@ -472,6 +507,7 @@ void iwl_dbg_tlv_init(struct iwl_trans *trans)
+ 		INIT_LIST_HEAD(&tp->trig_list);
+ 		INIT_LIST_HEAD(&tp->hcmd_list);
+ 		INIT_LIST_HEAD(&tp->active_trig_list);
++		INIT_LIST_HEAD(&tp->config_list);
+ 	}
+ }
+ 
+@@ -655,6 +691,10 @@ static void iwl_dbg_tlv_apply_buffers(struct iwl_fw_runtime *fwrt)
+ {
+ 	int ret, i;
+ 
++	if (fw_has_capa(&fwrt->fw->ucode_capa,
++			IWL_UCODE_TLV_CAPA_DRAM_FRAG_SUPPORT))
++		return;
++
+ 	for (i = 0; i < IWL_FW_INI_ALLOCATION_NUM; i++) {
+ 		ret = iwl_dbg_tlv_apply_buffer(fwrt, i);
+ 		if (ret)
+@@ -664,6 +704,87 @@ static void iwl_dbg_tlv_apply_buffers(struct iwl_fw_runtime *fwrt)
+ 	}
+ }
+ 
++static int iwl_dbg_tlv_update_dram(struct iwl_fw_runtime *fwrt,
++				   enum iwl_fw_ini_allocation_id alloc_id,
++				   struct iwl_dram_info *dram_info)
++{
++	struct iwl_fw_mon *fw_mon;
++	u32 remain_frags, num_frags;
++	int j, fw_mon_idx = 0;
++	struct iwl_buf_alloc_cmd *data;
++
++	if (le32_to_cpu(fwrt->trans->dbg.fw_mon_cfg[alloc_id].buf_location) !=
++			IWL_FW_INI_LOCATION_DRAM_PATH) {
++		IWL_DEBUG_FW(fwrt, "DRAM_PATH is not supported alloc_id %u\n", alloc_id);
++		return -1;
++	}
++
++	fw_mon = &fwrt->trans->dbg.fw_mon_ini[alloc_id];
++
++	/* the first fragment of DBGC1 is given to the FW via register
++	 * or context info
++	 */
++	if (alloc_id == IWL_FW_INI_ALLOCATION_ID_DBGC1)
++		fw_mon_idx++;
++
++	remain_frags = fw_mon->num_frags - fw_mon_idx;
++	if (!remain_frags)
++		return -1;
++
++	num_frags = min_t(u32, remain_frags, BUF_ALLOC_MAX_NUM_FRAGS);
++	data = &dram_info->dram_frags[alloc_id - 1];
++	data->alloc_id = cpu_to_le32(alloc_id);
++	data->num_frags = cpu_to_le32(num_frags);
++	data->buf_location = cpu_to_le32(IWL_FW_INI_LOCATION_DRAM_PATH);
++
++	IWL_DEBUG_FW(fwrt, "WRT: DRAM buffer details alloc_id=%u, num_frags=%u\n",
++		     cpu_to_le32(alloc_id), cpu_to_le32(num_frags));
++
++	for (j = 0; j < num_frags; j++) {
++		struct iwl_buf_alloc_frag *frag = &data->frags[j];
++		struct iwl_dram_data *fw_mon_frag = &fw_mon->frags[fw_mon_idx++];
++
++		frag->addr = cpu_to_le64(fw_mon_frag->physical);
++		frag->size = cpu_to_le32(fw_mon_frag->size);
++		IWL_DEBUG_FW(fwrt, "WRT: DRAM fragment details\n");
++		IWL_DEBUG_FW(fwrt, "frag=%u, addr=0x%016llx, size=0x%x)\n",
++			     j, cpu_to_le64(fw_mon_frag->physical),
++			     cpu_to_le32(fw_mon_frag->size));
++	}
++	return 0;
++}
++
++static void iwl_dbg_tlv_update_drams(struct iwl_fw_runtime *fwrt)
++{
++	int ret, i, dram_alloc = 0;
++	struct iwl_dram_info dram_info;
++	struct iwl_dram_data *frags =
++		&fwrt->trans->dbg.fw_mon_ini[IWL_FW_INI_ALLOCATION_ID_DBGC1].frags[0];
++
++	if (!fw_has_capa(&fwrt->fw->ucode_capa,
++			 IWL_UCODE_TLV_CAPA_DRAM_FRAG_SUPPORT))
++		return;
++
++	dram_info.first_word = cpu_to_le32(DRAM_INFO_FIRST_MAGIC_WORD);
++	dram_info.second_word = cpu_to_le32(DRAM_INFO_SECOND_MAGIC_WORD);
++
++	for (i = IWL_FW_INI_ALLOCATION_ID_DBGC1;
++	     i <= IWL_FW_INI_ALLOCATION_ID_DBGC3; i++) {
++		ret = iwl_dbg_tlv_update_dram(fwrt, i, &dram_info);
++		if (!ret)
++			dram_alloc++;
++		else
++			IWL_WARN(fwrt,
++				 "WRT: Failed to set DRAM buffer for alloc id %d, ret=%d\n",
++				 i, ret);
++	}
++	if (dram_alloc) {
++		memcpy(frags->block, &dram_info, sizeof(dram_info));
++		IWL_DEBUG_FW(fwrt, "block data after  %016x\n",
++			     *((int *)fwrt->trans->dbg.fw_mon_ini[1].frags[0].block));
++	}
++}
++
+ static void iwl_dbg_tlv_send_hcmds(struct iwl_fw_runtime *fwrt,
+ 				   struct list_head *hcmd_list)
+ {
+@@ -683,6 +804,97 @@ static void iwl_dbg_tlv_send_hcmds(struct iwl_fw_runtime *fwrt,
+ 	}
+ }
+ 
++static void iwl_dbg_tlv_apply_config(struct iwl_fw_runtime *fwrt,
++				     struct list_head *config_list)
++{
++	struct iwl_dbg_tlv_node *node;
++
++	list_for_each_entry(node, config_list, list) {
++		struct iwl_fw_ini_conf_set_tlv *config_list = (void *)node->tlv.data;
++		u32 count, address, value;
++		u32 len = (le32_to_cpu(node->tlv.length) - sizeof(*config_list)) / 8;
++		u32 type = le32_to_cpu(config_list->set_type);
++		u32 offset = le32_to_cpu(config_list->addr_offset);
++
++		switch (type) {
++		case IWL_FW_INI_CONFIG_SET_TYPE_DEVICE_PERIPHERY_MAC: {
++			if (!iwl_trans_grab_nic_access(fwrt->trans)) {
++				IWL_DEBUG_FW(fwrt, "WRT: failed to get nic access\n");
++				IWL_DEBUG_FW(fwrt, "WRT: skipping MAC PERIPHERY config\n");
++				continue;
++			}
++			IWL_DEBUG_FW(fwrt, "WRT:  MAC PERIPHERY config len: len %u\n", len);
++			for (count = 0; count < len; count++) {
++				address = le32_to_cpu(config_list->addr_val[count].address);
++				value = le32_to_cpu(config_list->addr_val[count].value);
++				iwl_trans_write_prph(fwrt->trans, address + offset, value);
++			}
++			iwl_trans_release_nic_access(fwrt->trans);
++		break;
++		}
++		case IWL_FW_INI_CONFIG_SET_TYPE_DEVICE_MEMORY: {
++			for (count = 0; count < len; count++) {
++				address = le32_to_cpu(config_list->addr_val[count].address);
++				value = le32_to_cpu(config_list->addr_val[count].value);
++				iwl_trans_write_mem32(fwrt->trans, address + offset, value);
++				IWL_DEBUG_FW(fwrt, "WRT: DEV_MEM: count %u, add: %u val: %u\n",
++					     count, address, value);
++			}
++		break;
++		}
++		case IWL_FW_INI_CONFIG_SET_TYPE_CSR: {
++			for (count = 0; count < len; count++) {
++				address = le32_to_cpu(config_list->addr_val[count].address);
++				value = le32_to_cpu(config_list->addr_val[count].value);
++				iwl_write32(fwrt->trans, address + offset, value);
++				IWL_DEBUG_FW(fwrt, "WRT: CSR: count %u, add: %u val: %u\n",
++					     count, address, value);
++			}
++		break;
++		}
++		case IWL_FW_INI_CONFIG_SET_TYPE_DBGC_DRAM_ADDR: {
++			struct iwl_dbgc1_info dram_info = {};
++			struct iwl_dram_data *frags = &fwrt->trans->dbg.fw_mon_ini[1].frags[0];
++			__le64 dram_base_addr = cpu_to_le64(frags->physical);
++			__le32 dram_size = cpu_to_le32(frags->size);
++			u64  dram_addr = le64_to_cpu(dram_base_addr);
++			u32 ret;
++
++			IWL_DEBUG_FW(fwrt, "WRT: dram_base_addr 0x%016llx, dram_size 0x%x\n",
++				     dram_base_addr, dram_size);
++			IWL_DEBUG_FW(fwrt, "WRT: config_list->addr_offset: %u\n",
++				     le32_to_cpu(config_list->addr_offset));
++			for (count = 0; count < len; count++) {
++				address = le32_to_cpu(config_list->addr_val[count].address);
++				dram_info.dbgc1_add_lsb =
++					cpu_to_le32((dram_addr & 0x00000000FFFFFFFFULL) + 0x400);
++				dram_info.dbgc1_add_msb =
++					cpu_to_le32((dram_addr & 0xFFFFFFFF00000000ULL) >> 32);
++				dram_info.dbgc1_size = cpu_to_le32(le32_to_cpu(dram_size) - 0x400);
++				ret = iwl_trans_write_mem(fwrt->trans,
++							  address + offset, &dram_info, 4);
++				if (ret) {
++					IWL_ERR(fwrt, "Failed to write dram_info to HW_SMEM\n");
++					break;
++				}
++			}
++			break;
++		}
++		case IWL_FW_INI_CONFIG_SET_TYPE_PERIPH_SCRATCH_HWM: {
++			u32 debug_token_config =
++				le32_to_cpu(config_list->addr_val[0].value);
++
++			IWL_DEBUG_FW(fwrt, "WRT: Setting HWM debug token config: %u\n",
++				     debug_token_config);
++			fwrt->trans->dbg.ucode_preset = debug_token_config;
++			break;
++		}
++		default:
++			break;
++		}
++	}
++}
++
+ static void iwl_dbg_tlv_periodic_trig_handler(struct timer_list *t)
+ {
+ 	struct iwl_dbg_tlv_timer_node *timer_node =
+@@ -1057,7 +1269,7 @@ void _iwl_dbg_tlv_time_point(struct iwl_fw_runtime *fwrt,
+ 			     union iwl_dbg_tlv_tp_data *tp_data,
+ 			     bool sync)
+ {
+-	struct list_head *hcmd_list, *trig_list;
++	struct list_head *hcmd_list, *trig_list, *conf_list;
+ 
+ 	if (!iwl_trans_dbg_ini_valid(fwrt->trans) ||
+ 	    tp_id == IWL_FW_INI_TIME_POINT_INVALID ||
+@@ -1066,15 +1278,19 @@ void _iwl_dbg_tlv_time_point(struct iwl_fw_runtime *fwrt,
+ 
+ 	hcmd_list = &fwrt->trans->dbg.time_point[tp_id].hcmd_list;
+ 	trig_list = &fwrt->trans->dbg.time_point[tp_id].active_trig_list;
++	conf_list = &fwrt->trans->dbg.time_point[tp_id].config_list;
+ 
+ 	switch (tp_id) {
+ 	case IWL_FW_INI_TIME_POINT_EARLY:
+ 		iwl_dbg_tlv_init_cfg(fwrt);
++		iwl_dbg_tlv_apply_config(fwrt, conf_list);
++		iwl_dbg_tlv_update_drams(fwrt);
+ 		iwl_dbg_tlv_tp_trigger(fwrt, sync, trig_list, tp_data, NULL);
+ 		break;
+ 	case IWL_FW_INI_TIME_POINT_AFTER_ALIVE:
+ 		iwl_dbg_tlv_apply_buffers(fwrt);
+ 		iwl_dbg_tlv_send_hcmds(fwrt, hcmd_list);
++		iwl_dbg_tlv_apply_config(fwrt, conf_list);
+ 		iwl_dbg_tlv_tp_trigger(fwrt, sync, trig_list, tp_data, NULL);
+ 		break;
+ 	case IWL_FW_INI_TIME_POINT_PERIODIC:
+@@ -1085,11 +1301,13 @@ void _iwl_dbg_tlv_time_point(struct iwl_fw_runtime *fwrt,
+ 	case IWL_FW_INI_TIME_POINT_MISSED_BEACONS:
+ 	case IWL_FW_INI_TIME_POINT_FW_DHC_NOTIFICATION:
+ 		iwl_dbg_tlv_send_hcmds(fwrt, hcmd_list);
++		iwl_dbg_tlv_apply_config(fwrt, conf_list);
+ 		iwl_dbg_tlv_tp_trigger(fwrt, sync, trig_list, tp_data,
+ 				       iwl_dbg_tlv_check_fw_pkt);
+ 		break;
+ 	default:
+ 		iwl_dbg_tlv_send_hcmds(fwrt, hcmd_list);
++		iwl_dbg_tlv_apply_config(fwrt, conf_list);
+ 		iwl_dbg_tlv_tp_trigger(fwrt, sync, trig_list, tp_data, NULL);
+ 		break;
+ 	}
+diff --git a/drivers/net/wireless/intel/iwlwifi/iwl-dbg-tlv.h b/drivers/net/wireless/intel/iwlwifi/iwl-dbg-tlv.h
+index c12b1fd3f..79287708b 100644
+--- a/drivers/net/wireless/intel/iwlwifi/iwl-dbg-tlv.h
++++ b/drivers/net/wireless/intel/iwlwifi/iwl-dbg-tlv.h
+@@ -33,11 +33,13 @@ union iwl_dbg_tlv_tp_data {
+  * @trig_list: list of triggers
+  * @active_trig_list: list of active triggers
+  * @hcmd_list: list of host commands
++ * @config_list: list of configuration
+  */
+ struct iwl_dbg_tlv_time_point_data {
+ 	struct list_head trig_list;
+ 	struct list_head active_trig_list;
+ 	struct list_head hcmd_list;
++	struct list_head config_list;
+ };
+ 
+ struct iwl_trans;
+diff --git a/drivers/net/wireless/intel/iwlwifi/iwl-drv.c b/drivers/net/wireless/intel/iwlwifi/iwl-drv.c
+index 524b0ad87..d4ac022a8 100644
+--- a/drivers/net/wireless/intel/iwlwifi/iwl-drv.c
++++ b/drivers/net/wireless/intel/iwlwifi/iwl-drv.c
+@@ -1136,6 +1136,7 @@ static int iwl_parse_tlv_firmware(struct iwl_drv *drv,
+ 		case IWL_UCODE_TLV_TYPE_HCMD:
+ 		case IWL_UCODE_TLV_TYPE_REGIONS:
+ 		case IWL_UCODE_TLV_TYPE_TRIGGERS:
++		case IWL_UCODE_TLV_TYPE_CONF_SET:
+ 			if (iwlwifi_mod_params.enable_ini)
+ 				iwl_dbg_tlv_alloc(drv->trans, tlv, false);
+ 			break;
+diff --git a/drivers/net/wireless/intel/iwlwifi/iwl-trans.h b/drivers/net/wireless/intel/iwlwifi/iwl-trans.h
+index 8f0ff540f..476535efa 100644
+--- a/drivers/net/wireless/intel/iwlwifi/iwl-trans.h
++++ b/drivers/net/wireless/intel/iwlwifi/iwl-trans.h
+@@ -723,8 +723,8 @@ struct iwl_self_init_dram {
+  * @debug_info_tlv_list: list of debug info TLVs
+  * @time_point: array of debug time points
+  * @periodic_trig_list: periodic triggers list
+- * @domains_bitmap: bitmap of active domains other than
+- *	&IWL_FW_INI_DOMAIN_ALWAYS_ON
++ * @domains_bitmap: bitmap of active domains other than &IWL_FW_INI_DOMAIN_ALWAYS_ON
++ * @ucode_preset: preset based on ucode
+  */
+ struct iwl_trans_debug {
+ 	u8 n_dest_reg;
+@@ -758,6 +758,7 @@ struct iwl_trans_debug {
+ 	struct list_head periodic_trig_list;
+ 
+ 	u32 domains_bitmap;
++	u32 ucode_preset;
+ };
+ 
+ struct iwl_dma_ptr {
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/d3.c b/drivers/net/wireless/intel/iwlwifi/mvm/d3.c
+index 6dde3bd8f..8b295f54d 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/d3.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/d3.c
+@@ -1380,12 +1380,49 @@ int iwl_mvm_suspend(struct ieee80211_hw *hw, struct cfg80211_wowlan *wowlan)
+ 
+ /* converted data from the different status responses */
+ struct iwl_wowlan_status_data {
+-	u16 pattern_number;
+-	u16 qos_seq_ctr[8];
++	u64 replay_ctr;
++	u32 num_of_gtk_rekeys;
++	u32 received_beacons;
+ 	u32 wakeup_reasons;
+ 	u32 wake_packet_length;
+ 	u32 wake_packet_bufsize;
+-	const u8 *wake_packet;
++	u16 pattern_number;
++	u16 non_qos_seq_ctr;
++	u16 qos_seq_ctr[8];
++	u8 tid_tear_down;
++
++	struct {
++		/*
++		 * We store both the TKIP and AES representations
++		 * coming from the firmware because we decode the
++		 * data from there before we iterate the keys and
++		 * know which one we need.
++		 */
++		struct {
++			struct ieee80211_key_seq seq[IWL_MAX_TID_COUNT];
++		} tkip, aes;
++		/* including RX MIC key for TKIP */
++		u8 key[WOWLAN_KEY_MAX_SIZE];
++		u8 len;
++		u8 flags;
++	} gtk;
++
++	struct {
++		/* Same as above */
++		struct {
++			struct ieee80211_key_seq seq[IWL_MAX_TID_COUNT];
++			u64 tx_pn;
++		} tkip, aes;
++	} ptk;
++
++	struct {
++		u64 ipn;
++		u8 key[WOWLAN_KEY_MAX_SIZE];
++		u8 len;
++		u8 flags;
++	} igtk;
++
++	u8 wake_packet[];
+ };
+ 
+ static void iwl_mvm_report_wakeup_reasons(struct iwl_mvm *mvm,
+@@ -1541,77 +1578,90 @@ static void iwl_mvm_tkip_sc_to_seq(struct tkip_sc *sc,
+ 	seq->tkip.iv16 = le16_to_cpu(sc->iv16);
+ }
+ 
+-static void iwl_mvm_set_aes_rx_seq(struct iwl_mvm *mvm, struct aes_sc *scs,
+-				   struct ieee80211_sta *sta,
+-				   struct ieee80211_key_conf *key)
++static void iwl_mvm_set_key_rx_seq_tids(struct ieee80211_key_conf *key,
++					struct ieee80211_key_seq *seq)
+ {
+ 	int tid;
+ 
+-	BUILD_BUG_ON(IWL_NUM_RSC != IEEE80211_NUM_TIDS);
++	for (tid = 0; tid < IWL_MAX_TID_COUNT; tid++)
++		ieee80211_set_key_rx_seq(key, tid, &seq[tid]);
++}
+ 
+-	if (sta && iwl_mvm_has_new_rx_api(mvm)) {
+-		struct iwl_mvm_sta *mvmsta;
+-		struct iwl_mvm_key_pn *ptk_pn;
++static void iwl_mvm_set_aes_ptk_rx_seq(struct iwl_mvm *mvm,
++				       struct iwl_wowlan_status_data *status,
++				       struct ieee80211_sta *sta,
++				       struct ieee80211_key_conf *key)
++{
++	struct iwl_mvm_sta *mvmsta = iwl_mvm_sta_from_mac80211(sta);
++	struct iwl_mvm_key_pn *ptk_pn;
++	int tid;
+ 
+-		mvmsta = iwl_mvm_sta_from_mac80211(sta);
++	iwl_mvm_set_key_rx_seq_tids(key, status->ptk.aes.seq);
+ 
+-		rcu_read_lock();
+-		ptk_pn = rcu_dereference(mvmsta->ptk_pn[key->keyidx]);
+-		if (WARN_ON(!ptk_pn)) {
+-			rcu_read_unlock();
+-			return;
+-		}
++	if (!iwl_mvm_has_new_rx_api(mvm))
++		return;
+ 
+-		for (tid = 0; tid < IWL_MAX_TID_COUNT; tid++) {
+-			struct ieee80211_key_seq seq = {};
+-			int i;
+ 
+-			iwl_mvm_aes_sc_to_seq(&scs[tid], &seq);
+-			ieee80211_set_key_rx_seq(key, tid, &seq);
+-			for (i = 1; i < mvm->trans->num_rx_queues; i++)
+-				memcpy(ptk_pn->q[i].pn[tid],
+-				       seq.ccmp.pn, IEEE80211_CCMP_PN_LEN);
+-		}
++	rcu_read_lock();
++	ptk_pn = rcu_dereference(mvmsta->ptk_pn[key->keyidx]);
++	if (WARN_ON(!ptk_pn)) {
+ 		rcu_read_unlock();
+-	} else {
+-		for (tid = 0; tid < IWL_NUM_RSC; tid++) {
+-			struct ieee80211_key_seq seq = {};
++		return;
++	}
+ 
+-			iwl_mvm_aes_sc_to_seq(&scs[tid], &seq);
+-			ieee80211_set_key_rx_seq(key, tid, &seq);
+-		}
++	for (tid = 0; tid < IWL_MAX_TID_COUNT; tid++) {
++		int i;
++
++		for (i = 1; i < mvm->trans->num_rx_queues; i++)
++			memcpy(ptk_pn->q[i].pn[tid],
++			       status->ptk.aes.seq[tid].ccmp.pn,
++			       IEEE80211_CCMP_PN_LEN);
+ 	}
++	rcu_read_unlock();
+ }
+ 
+-static void iwl_mvm_set_tkip_rx_seq(struct tkip_sc *scs,
+-				    struct ieee80211_key_conf *key)
++static void iwl_mvm_convert_key_counters(struct iwl_wowlan_status_data *status,
++					 union iwl_all_tsc_rsc *sc)
+ {
+-	int tid;
++	int i;
+ 
+-	BUILD_BUG_ON(IWL_NUM_RSC != IEEE80211_NUM_TIDS);
++	BUILD_BUG_ON(IWL_MAX_TID_COUNT > IWL_MAX_TID_COUNT);
++	BUILD_BUG_ON(IWL_MAX_TID_COUNT > IWL_NUM_RSC);
+ 
+-	for (tid = 0; tid < IWL_NUM_RSC; tid++) {
+-		struct ieee80211_key_seq seq = {};
++	/* GTK RX counters */
++	for (i = 0; i < IWL_MAX_TID_COUNT; i++) {
++		iwl_mvm_tkip_sc_to_seq(&sc->tkip.multicast_rsc[i],
++				       &status->gtk.tkip.seq[i]);
++		iwl_mvm_aes_sc_to_seq(&sc->aes.multicast_rsc[i],
++				      &status->gtk.aes.seq[i]);
++	}
+ 
+-		iwl_mvm_tkip_sc_to_seq(&scs[tid], &seq);
+-		ieee80211_set_key_rx_seq(key, tid, &seq);
++	/* PTK TX counter */
++	status->ptk.tkip.tx_pn = (u64)le16_to_cpu(sc->tkip.tsc.iv16) |
++				 ((u64)le32_to_cpu(sc->tkip.tsc.iv32) << 16);
++	status->ptk.aes.tx_pn = le64_to_cpu(sc->aes.tsc.pn);
++
++	/* PTK RX counters */
++	for (i = 0; i < IWL_MAX_TID_COUNT; i++) {
++		iwl_mvm_tkip_sc_to_seq(&sc->tkip.unicast_rsc[i],
++				       &status->ptk.tkip.seq[i]);
++		iwl_mvm_aes_sc_to_seq(&sc->aes.unicast_rsc[i],
++				      &status->ptk.aes.seq[i]);
+ 	}
+ }
+ 
+ static void iwl_mvm_set_key_rx_seq(struct iwl_mvm *mvm,
+ 				   struct ieee80211_key_conf *key,
+-				   struct iwl_wowlan_status *status)
++				   struct iwl_wowlan_status_data *status)
+ {
+-	union iwl_all_tsc_rsc *rsc = &status->gtk[0].rsc.all_tsc_rsc;
+-
+ 	switch (key->cipher) {
+ 	case WLAN_CIPHER_SUITE_CCMP:
+ 	case WLAN_CIPHER_SUITE_GCMP:
+ 	case WLAN_CIPHER_SUITE_GCMP_256:
+-		iwl_mvm_set_aes_rx_seq(mvm, rsc->aes.multicast_rsc, NULL, key);
++		iwl_mvm_set_key_rx_seq_tids(key, status->gtk.aes.seq);
+ 		break;
+ 	case WLAN_CIPHER_SUITE_TKIP:
+-		iwl_mvm_set_tkip_rx_seq(rsc->tkip.multicast_rsc, key);
++		iwl_mvm_set_key_rx_seq_tids(key, status->gtk.tkip.seq);
+ 		break;
+ 	default:
+ 		WARN_ON(1);
+@@ -1620,7 +1670,7 @@ static void iwl_mvm_set_key_rx_seq(struct iwl_mvm *mvm,
+ 
+ struct iwl_mvm_d3_gtk_iter_data {
+ 	struct iwl_mvm *mvm;
+-	struct iwl_wowlan_status *status;
++	struct iwl_wowlan_status_data *status;
+ 	void *last_gtk;
+ 	u32 cipher;
+ 	bool find_phase, unhandled_cipher;
+@@ -1634,6 +1684,7 @@ static void iwl_mvm_d3_update_keys(struct ieee80211_hw *hw,
+ 				   void *_data)
+ {
+ 	struct iwl_mvm_d3_gtk_iter_data *data = _data;
++	struct iwl_wowlan_status_data *status = data->status;
+ 
+ 	if (data->unhandled_cipher)
+ 		return;
+@@ -1662,10 +1713,6 @@ static void iwl_mvm_d3_update_keys(struct ieee80211_hw *hw,
+ 	 * note that this assumes no TDLS sessions are active
+ 	 */
+ 	if (sta) {
+-		struct ieee80211_key_seq seq = {};
+-		union iwl_all_tsc_rsc *sc =
+-			&data->status->gtk[0].rsc.all_tsc_rsc;
+-
+ 		if (data->find_phase)
+ 			return;
+ 
+@@ -1673,16 +1720,12 @@ static void iwl_mvm_d3_update_keys(struct ieee80211_hw *hw,
+ 		case WLAN_CIPHER_SUITE_CCMP:
+ 		case WLAN_CIPHER_SUITE_GCMP:
+ 		case WLAN_CIPHER_SUITE_GCMP_256:
+-			iwl_mvm_set_aes_rx_seq(data->mvm, sc->aes.unicast_rsc,
+-					       sta, key);
+-			atomic64_set(&key->tx_pn, le64_to_cpu(sc->aes.tsc.pn));
++			atomic64_set(&key->tx_pn, status->ptk.aes.tx_pn);
++			iwl_mvm_set_aes_ptk_rx_seq(data->mvm, status, sta, key);
+ 			break;
+ 		case WLAN_CIPHER_SUITE_TKIP:
+-			iwl_mvm_tkip_sc_to_seq(&sc->tkip.tsc, &seq);
+-			iwl_mvm_set_tkip_rx_seq(sc->tkip.unicast_rsc, key);
+-			atomic64_set(&key->tx_pn,
+-				     (u64)seq.tkip.iv16 |
+-				     ((u64)seq.tkip.iv32 << 16));
++			atomic64_set(&key->tx_pn, status->ptk.tkip.tx_pn);
++			iwl_mvm_set_key_rx_seq_tids(key, status->ptk.tkip.seq);
+ 			break;
+ 		}
+ 
+@@ -1704,7 +1747,7 @@ static void iwl_mvm_d3_update_keys(struct ieee80211_hw *hw,
+ 
+ static bool iwl_mvm_setup_connection_keep(struct iwl_mvm *mvm,
+ 					  struct ieee80211_vif *vif,
+-					  struct iwl_wowlan_status *status)
++					  struct iwl_wowlan_status_data *status)
+ {
+ 	struct iwl_mvm_vif *mvmvif = iwl_mvm_vif_from_mac80211(vif);
+ 	struct iwl_mvm_d3_gtk_iter_data gtkdata = {
+@@ -1718,7 +1761,7 @@ static bool iwl_mvm_setup_connection_keep(struct iwl_mvm *mvm,
+ 	if (!status || !vif->bss_conf.bssid)
+ 		return false;
+ 
+-	if (le32_to_cpu(status->wakeup_reasons) & disconnection_reasons)
++	if (status->wakeup_reasons & disconnection_reasons)
+ 		return false;
+ 
+ 	/* find last GTK that we used initially, if any */
+@@ -1742,7 +1785,7 @@ static bool iwl_mvm_setup_connection_keep(struct iwl_mvm *mvm,
+ 			    iwl_mvm_d3_update_keys, &gtkdata);
+ 
+ 	IWL_DEBUG_WOWLAN(mvm, "num of GTK rekeying %d\n",
+-			 le32_to_cpu(status->num_of_gtk_rekeys));
++			 status->num_of_gtk_rekeys);
+ 	if (status->num_of_gtk_rekeys) {
+ 		struct ieee80211_key_conf *key;
+ 		struct {
+@@ -1751,36 +1794,32 @@ static bool iwl_mvm_setup_connection_keep(struct iwl_mvm *mvm,
+ 		} conf = {
+ 			.conf.cipher = gtkdata.cipher,
+ 			.conf.keyidx =
+-				iwlmvm_wowlan_gtk_idx(&status->gtk[0]),
++				status->gtk.flags & IWL_WOWLAN_GTK_IDX_MASK,
+ 		};
+ 		__be64 replay_ctr;
+ 
+ 		IWL_DEBUG_WOWLAN(mvm,
+ 				 "Received from FW GTK cipher %d, key index %d\n",
+ 				 conf.conf.cipher, conf.conf.keyidx);
++
++		BUILD_BUG_ON(WLAN_KEY_LEN_CCMP != WLAN_KEY_LEN_GCMP);
++		BUILD_BUG_ON(sizeof(conf.key) < WLAN_KEY_LEN_CCMP);
++		BUILD_BUG_ON(sizeof(conf.key) < WLAN_KEY_LEN_GCMP_256);
++		BUILD_BUG_ON(sizeof(conf.key) < WLAN_KEY_LEN_TKIP);
++		BUILD_BUG_ON(sizeof(conf.key) < sizeof(status->gtk.key));
++
++		memcpy(conf.conf.key, status->gtk.key, sizeof(status->gtk.key));
++
+ 		switch (gtkdata.cipher) {
+ 		case WLAN_CIPHER_SUITE_CCMP:
+ 		case WLAN_CIPHER_SUITE_GCMP:
+-			BUILD_BUG_ON(WLAN_KEY_LEN_CCMP != WLAN_KEY_LEN_GCMP);
+-			BUILD_BUG_ON(sizeof(conf.key) < WLAN_KEY_LEN_CCMP);
+ 			conf.conf.keylen = WLAN_KEY_LEN_CCMP;
+-			memcpy(conf.conf.key, status->gtk[0].key,
+-			       WLAN_KEY_LEN_CCMP);
+ 			break;
+ 		case WLAN_CIPHER_SUITE_GCMP_256:
+-			BUILD_BUG_ON(sizeof(conf.key) < WLAN_KEY_LEN_GCMP_256);
+ 			conf.conf.keylen = WLAN_KEY_LEN_GCMP_256;
+-			memcpy(conf.conf.key, status->gtk[0].key,
+-			       WLAN_KEY_LEN_GCMP_256);
+ 			break;
+ 		case WLAN_CIPHER_SUITE_TKIP:
+-			BUILD_BUG_ON(sizeof(conf.key) < WLAN_KEY_LEN_TKIP);
+ 			conf.conf.keylen = WLAN_KEY_LEN_TKIP;
+-			memcpy(conf.conf.key, status->gtk[0].key, 16);
+-			/* leave TX MIC key zeroed, we don't use it anyway */
+-			memcpy(conf.conf.key +
+-			       NL80211_TKIP_DATA_OFFSET_RX_MIC_KEY,
+-			       status->gtk[0].tkip_mic_key, 8);
+ 			break;
+ 		}
+ 
+@@ -1789,8 +1828,7 @@ static bool iwl_mvm_setup_connection_keep(struct iwl_mvm *mvm,
+ 			return false;
+ 		iwl_mvm_set_key_rx_seq(mvm, key, status);
+ 
+-		replay_ctr =
+-			cpu_to_be64(le64_to_cpu(status->replay_ctr));
++		replay_ctr = cpu_to_be64(status->replay_ctr);
+ 
+ 		ieee80211_gtk_rekey_notify(vif, vif->bss_conf.bssid,
+ 					   (void *)&replay_ctr, GFP_KERNEL);
+@@ -1801,7 +1839,7 @@ static bool iwl_mvm_setup_connection_keep(struct iwl_mvm *mvm,
+ 				    WOWLAN_GET_STATUSES, 0) < 10) {
+ 		mvmvif->seqno_valid = true;
+ 		/* +0x10 because the set API expects next-to-use, not last-used */
+-		mvmvif->seqno = le16_to_cpu(status->non_qos_seq_ctr) + 0x10;
++		mvmvif->seqno = status->non_qos_seq_ctr + 0x10;
+ 	}
+ 
+ 	return true;
+@@ -1809,13 +1847,13 @@ static bool iwl_mvm_setup_connection_keep(struct iwl_mvm *mvm,
+ 
+ /* Occasionally, templates would be nice. This is one of those times ... */
+ #define iwl_mvm_parse_wowlan_status_common(_ver)			\
+-static struct iwl_wowlan_status *					\
++static struct iwl_wowlan_status_data *					\
+ iwl_mvm_parse_wowlan_status_common_ ## _ver(struct iwl_mvm *mvm,	\
+-					    void *_data, int len)	\
++					    struct iwl_wowlan_status_ ##_ver *data,\
++					    int len)			\
+ {									\
+-	struct iwl_wowlan_status *status;				\
+-	struct iwl_wowlan_status_ ##_ver *data = _data;			\
+-	int data_size;							\
++	struct iwl_wowlan_status_data *status;				\
++	int data_size, i;						\
+ 									\
+ 	if (len < sizeof(*data)) {					\
+ 		IWL_ERR(mvm, "Invalid WoWLAN status response!\n");	\
+@@ -1833,18 +1871,22 @@ iwl_mvm_parse_wowlan_status_common_ ## _ver(struct iwl_mvm *mvm,	\
+ 		return ERR_PTR(-ENOMEM);				\
+ 									\
+ 	/* copy all the common fields */				\
+-	status->replay_ctr = data->replay_ctr;				\
+-	status->pattern_number = data->pattern_number;			\
+-	status->non_qos_seq_ctr = data->non_qos_seq_ctr;		\
+-	memcpy(status->qos_seq_ctr, data->qos_seq_ctr,			\
+-	       sizeof(status->qos_seq_ctr));				\
+-	status->wakeup_reasons = data->wakeup_reasons;			\
+-	status->num_of_gtk_rekeys = data->num_of_gtk_rekeys;		\
+-	status->received_beacons = data->received_beacons;		\
+-	status->wake_packet_length = data->wake_packet_length;		\
+-	status->wake_packet_bufsize = data->wake_packet_bufsize;	\
++	status->replay_ctr = le64_to_cpu(data->replay_ctr);		\
++	status->pattern_number = le16_to_cpu(data->pattern_number);	\
++	status->non_qos_seq_ctr = le16_to_cpu(data->non_qos_seq_ctr);	\
++	for (i = 0; i < 8; i++)						\
++		status->qos_seq_ctr[i] =				\
++			le16_to_cpu(data->qos_seq_ctr[i]);		\
++	status->wakeup_reasons = le32_to_cpu(data->wakeup_reasons);	\
++	status->num_of_gtk_rekeys =					\
++		le32_to_cpu(data->num_of_gtk_rekeys);			\
++	status->received_beacons = le32_to_cpu(data->received_beacons);	\
++	status->wake_packet_length =					\
++		le32_to_cpu(data->wake_packet_length);			\
++	status->wake_packet_bufsize =					\
++		le32_to_cpu(data->wake_packet_bufsize);			\
+ 	memcpy(status->wake_packet, data->wake_packet,			\
+-	       le32_to_cpu(status->wake_packet_bufsize));		\
++	       status->wake_packet_bufsize);				\
+ 									\
+ 	return status;							\
+ }
+@@ -1853,10 +1895,49 @@ iwl_mvm_parse_wowlan_status_common(v6)
+ iwl_mvm_parse_wowlan_status_common(v7)
+ iwl_mvm_parse_wowlan_status_common(v9)
+ 
+-static struct iwl_wowlan_status *
++static void iwl_mvm_convert_gtk(struct iwl_wowlan_status_data *status,
++				struct iwl_wowlan_gtk_status *data)
++{
++	BUILD_BUG_ON(sizeof(status->gtk.key) < sizeof(data->key));
++	BUILD_BUG_ON(NL80211_TKIP_DATA_OFFSET_RX_MIC_KEY +
++		     sizeof(data->tkip_mic_key) >
++		     sizeof(status->gtk.key));
++
++	status->gtk.len = data->key_len;
++	status->gtk.flags = data->key_flags;
++
++	memcpy(status->gtk.key, data->key, sizeof(data->key));
++
++	/* if it's as long as the TKIP encryption key, copy MIC key */
++	if (status->gtk.len == NL80211_TKIP_DATA_OFFSET_TX_MIC_KEY)
++		memcpy(status->gtk.key + NL80211_TKIP_DATA_OFFSET_RX_MIC_KEY,
++		       data->tkip_mic_key, sizeof(data->tkip_mic_key));
++}
++
++static void iwl_mvm_convert_igtk(struct iwl_wowlan_status_data *status,
++				 struct iwl_wowlan_igtk_status *data)
++{
++	const u8 *ipn = data->ipn;
++
++	BUILD_BUG_ON(sizeof(status->igtk.key) < sizeof(data->key));
++
++	status->igtk.len = data->key_len;
++	status->igtk.flags = data->key_flags;
++
++	memcpy(status->igtk.key, data->key, sizeof(data->key));
++
++	status->igtk.ipn = ((u64)ipn[5] <<  0) |
++			   ((u64)ipn[4] <<  8) |
++			   ((u64)ipn[3] << 16) |
++			   ((u64)ipn[2] << 24) |
++			   ((u64)ipn[1] << 32) |
++			   ((u64)ipn[0] << 40);
++}
++
++static struct iwl_wowlan_status_data *
+ iwl_mvm_send_wowlan_get_status(struct iwl_mvm *mvm, u8 sta_id)
+ {
+-	struct iwl_wowlan_status *status;
++	struct iwl_wowlan_status_data *status;
+ 	struct iwl_wowlan_get_status_cmd get_status_cmd = {
+ 		.sta_id = cpu_to_le32(sta_id),
+ 	};
+@@ -1896,59 +1977,57 @@ iwl_mvm_send_wowlan_get_status(struct iwl_mvm *mvm, u8 sta_id)
+ 			IWL_UCODE_TLV_API_WOWLAN_KEY_MATERIAL)) {
+ 		struct iwl_wowlan_status_v6 *v6 = (void *)cmd.resp_pkt->data;
+ 
+-		status = iwl_mvm_parse_wowlan_status_common_v6(mvm,
+-							       cmd.resp_pkt->data,
+-							       len);
++		status = iwl_mvm_parse_wowlan_status_common_v6(mvm, v6, len);
+ 		if (IS_ERR(status))
+ 			goto out_free_resp;
+ 
+ 		BUILD_BUG_ON(sizeof(v6->gtk.decrypt_key) >
+-			     sizeof(status->gtk[0].key));
+-		BUILD_BUG_ON(sizeof(v6->gtk.tkip_mic_key) >
+-			     sizeof(status->gtk[0].tkip_mic_key));
++			     sizeof(status->gtk.key));
++		BUILD_BUG_ON(NL80211_TKIP_DATA_OFFSET_RX_MIC_KEY +
++			     sizeof(v6->gtk.tkip_mic_key) >
++			     sizeof(status->gtk.key));
+ 
+ 		/* copy GTK info to the right place */
+-		memcpy(status->gtk[0].key, v6->gtk.decrypt_key,
++		memcpy(status->gtk.key, v6->gtk.decrypt_key,
+ 		       sizeof(v6->gtk.decrypt_key));
+-		memcpy(status->gtk[0].tkip_mic_key, v6->gtk.tkip_mic_key,
++		memcpy(status->gtk.key + NL80211_TKIP_DATA_OFFSET_RX_MIC_KEY,
++		       v6->gtk.tkip_mic_key,
+ 		       sizeof(v6->gtk.tkip_mic_key));
+-		memcpy(&status->gtk[0].rsc, &v6->gtk.rsc,
+-		       sizeof(status->gtk[0].rsc));
++
++		iwl_mvm_convert_key_counters(status, &v6->gtk.rsc.all_tsc_rsc);
+ 
+ 		/* hardcode the key length to 16 since v6 only supports 16 */
+-		status->gtk[0].key_len = 16;
++		status->gtk.len = 16;
+ 
+ 		/*
+ 		 * The key index only uses 2 bits (values 0 to 3) and
+ 		 * we always set bit 7 which means this is the
+ 		 * currently used key.
+ 		 */
+-		status->gtk[0].key_flags = v6->gtk.key_index | BIT(7);
++		status->gtk.flags = v6->gtk.key_index | BIT(7);
+ 	} else if (notif_ver == 7) {
+ 		struct iwl_wowlan_status_v7 *v7 = (void *)cmd.resp_pkt->data;
+ 
+-		status = iwl_mvm_parse_wowlan_status_common_v7(mvm,
+-							       cmd.resp_pkt->data,
+-							       len);
++		status = iwl_mvm_parse_wowlan_status_common_v7(mvm, v7, len);
+ 		if (IS_ERR(status))
+ 			goto out_free_resp;
+ 
+-		status->gtk[0] = v7->gtk[0];
+-		status->igtk[0] = v7->igtk[0];
++		iwl_mvm_convert_key_counters(status, &v7->gtk[0].rsc.all_tsc_rsc);
++		iwl_mvm_convert_gtk(status, &v7->gtk[0]);
++		iwl_mvm_convert_igtk(status, &v7->igtk[0]);
+ 	} else if (notif_ver == 9 || notif_ver == 10 || notif_ver == 11) {
+ 		struct iwl_wowlan_status_v9 *v9 = (void *)cmd.resp_pkt->data;
+ 
+ 		/* these three command versions have same layout and size, the
+ 		 * difference is only in a few not used (reserved) fields.
+ 		 */
+-		status = iwl_mvm_parse_wowlan_status_common_v9(mvm,
+-							       cmd.resp_pkt->data,
+-							       len);
++		status = iwl_mvm_parse_wowlan_status_common_v9(mvm, v9, len);
+ 		if (IS_ERR(status))
+ 			goto out_free_resp;
+ 
+-		status->gtk[0] = v9->gtk[0];
+-		status->igtk[0] = v9->igtk[0];
++		iwl_mvm_convert_key_counters(status, &v9->gtk[0].rsc.all_tsc_rsc);
++		iwl_mvm_convert_gtk(status, &v9->gtk[0]);
++		iwl_mvm_convert_igtk(status, &v9->igtk[0]);
+ 
+ 		status->tid_tear_down = v9->tid_tear_down;
+ 	} else {
+@@ -1963,7 +2042,7 @@ iwl_mvm_send_wowlan_get_status(struct iwl_mvm *mvm, u8 sta_id)
+ 	return status;
+ }
+ 
+-static struct iwl_wowlan_status *
++static struct iwl_wowlan_status_data *
+ iwl_mvm_get_wakeup_status(struct iwl_mvm *mvm, u8 sta_id)
+ {
+ 	u8 cmd_ver = iwl_fw_lookup_cmd_ver(mvm->fw, LONG_GROUP,
+@@ -1988,29 +2067,17 @@ static bool iwl_mvm_query_wakeup_reasons(struct iwl_mvm *mvm,
+ 					 struct ieee80211_vif *vif)
+ {
+ 	struct iwl_mvm_vif *mvmvif = iwl_mvm_vif_from_mac80211(vif);
+-	struct iwl_wowlan_status_data status;
+-	struct iwl_wowlan_status *fw_status;
++	struct iwl_wowlan_status_data *status;
+ 	int i;
+ 	bool keep;
+ 	struct iwl_mvm_sta *mvm_ap_sta;
+ 
+-	fw_status = iwl_mvm_get_wakeup_status(mvm, mvmvif->ap_sta_id);
+-	if (IS_ERR_OR_NULL(fw_status))
++	status = iwl_mvm_get_wakeup_status(mvm, mvmvif->ap_sta_id);
++	if (IS_ERR(status))
+ 		goto out_unlock;
+ 
+ 	IWL_DEBUG_WOWLAN(mvm, "wakeup reason 0x%x\n",
+-			 le32_to_cpu(fw_status->wakeup_reasons));
+-
+-	status.pattern_number = le16_to_cpu(fw_status->pattern_number);
+-	for (i = 0; i < 8; i++)
+-		status.qos_seq_ctr[i] =
+-			le16_to_cpu(fw_status->qos_seq_ctr[i]);
+-	status.wakeup_reasons = le32_to_cpu(fw_status->wakeup_reasons);
+-	status.wake_packet_length =
+-		le32_to_cpu(fw_status->wake_packet_length);
+-	status.wake_packet_bufsize =
+-		le32_to_cpu(fw_status->wake_packet_bufsize);
+-	status.wake_packet = fw_status->wake_packet;
++			 status->wakeup_reasons);
+ 
+ 	/* still at hard-coded place 0 for D3 image */
+ 	mvm_ap_sta = iwl_mvm_sta_from_staid_protected(mvm, 0);
+@@ -2018,7 +2085,7 @@ static bool iwl_mvm_query_wakeup_reasons(struct iwl_mvm *mvm,
+ 		goto out_free;
+ 
+ 	for (i = 0; i < IWL_MAX_TID_COUNT; i++) {
+-		u16 seq = status.qos_seq_ctr[i];
++		u16 seq = status->qos_seq_ctr[i];
+ 		/* firmware stores last-used value, we store next value */
+ 		seq += 0x10;
+ 		mvm_ap_sta->tid_data[i].seq_number = seq;
+@@ -2034,15 +2101,15 @@ static bool iwl_mvm_query_wakeup_reasons(struct iwl_mvm *mvm,
+ 	/* now we have all the data we need, unlock to avoid mac80211 issues */
+ 	mutex_unlock(&mvm->mutex);
+ 
+-	iwl_mvm_report_wakeup_reasons(mvm, vif, &status);
++	iwl_mvm_report_wakeup_reasons(mvm, vif, status);
+ 
+-	keep = iwl_mvm_setup_connection_keep(mvm, vif, fw_status);
++	keep = iwl_mvm_setup_connection_keep(mvm, vif, status);
+ 
+-	kfree(fw_status);
++	kfree(status);
+ 	return keep;
+ 
+ out_free:
+-	kfree(fw_status);
++	kfree(status);
+ out_unlock:
+ 	mutex_unlock(&mvm->mutex);
+ 	return false;
+@@ -2166,16 +2233,16 @@ static void iwl_mvm_query_netdetect_reasons(struct iwl_mvm *mvm,
+ 		.pattern_idx = -1,
+ 	};
+ 	struct cfg80211_wowlan_wakeup *wakeup_report = &wakeup;
++	struct iwl_wowlan_status_data *status;
+ 	struct iwl_mvm_nd_query_results query;
+-	struct iwl_wowlan_status *fw_status;
+ 	unsigned long matched_profiles;
+ 	u32 reasons = 0;
+ 	int i, n_matches, ret;
+ 
+-	fw_status = iwl_mvm_get_wakeup_status(mvm, IWL_MVM_INVALID_STA);
+-	if (!IS_ERR_OR_NULL(fw_status)) {
+-		reasons = le32_to_cpu(fw_status->wakeup_reasons);
+-		kfree(fw_status);
++	status = iwl_mvm_get_wakeup_status(mvm, IWL_MVM_INVALID_STA);
++	if (!IS_ERR(status)) {
++		reasons = status->wakeup_reasons;
++		kfree(status);
+ 	}
+ 
+ 	if (reasons & IWL_WOWLAN_WAKEUP_BY_RFKILL_DEASSERTED)
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/fw.c b/drivers/net/wireless/intel/iwlwifi/mvm/fw.c
+index 6d439ae7b..a1bc7e94f 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/fw.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/fw.c
+@@ -763,14 +763,18 @@ int iwl_mvm_get_sar_geo_profile(struct iwl_mvm *mvm)
+ 	int ret;
+ 	struct iwl_host_cmd cmd;
+ 	u8 cmd_ver = iwl_fw_lookup_cmd_ver(mvm->fw, PHY_OPS_GROUP,
+-					   GEO_TX_POWER_LIMIT,
++					   PER_CHAIN_LIMIT_OFFSET_CMD,
+ 					   IWL_FW_CMD_VER_UNKNOWN);
+ 
+ 	/* the ops field is at the same spot for all versions, so set in v1 */
+ 	geo_tx_cmd.v1.ops =
+ 		cpu_to_le32(IWL_PER_CHAIN_OFFSET_GET_CURRENT_TABLE);
+ 
+-	if (cmd_ver == 3)
++	if (cmd_ver == 5)
++		len = sizeof(geo_tx_cmd.v5);
++	else if (cmd_ver == 4)
++		len = sizeof(geo_tx_cmd.v4);
++	else if (cmd_ver == 3)
+ 		len = sizeof(geo_tx_cmd.v3);
+ 	else if (fw_has_api(&mvm->fwrt.fw->ucode_capa,
+ 			    IWL_UCODE_TLV_API_SAR_TABLE_VER))
+@@ -782,7 +786,7 @@ int iwl_mvm_get_sar_geo_profile(struct iwl_mvm *mvm)
+ 		return -EOPNOTSUPP;
+ 
+ 	cmd = (struct iwl_host_cmd){
+-		.id =  WIDE_ID(PHY_OPS_GROUP, GEO_TX_POWER_LIMIT),
++		.id =  WIDE_ID(PHY_OPS_GROUP, PER_CHAIN_LIMIT_OFFSET_CMD),
+ 		.len = { len, },
+ 		.flags = CMD_WANT_SKB,
+ 		.data = { &geo_tx_cmd },
+@@ -797,7 +801,7 @@ int iwl_mvm_get_sar_geo_profile(struct iwl_mvm *mvm)
+ 	resp = (void *)cmd.resp_pkt->data;
+ 	ret = le32_to_cpu(resp->profile_idx);
+ 
+-	if (WARN_ON(ret > ACPI_NUM_GEO_PROFILES))
++	if (WARN_ON(ret > ACPI_NUM_GEO_PROFILES_REV3))
+ 		ret = -EIO;
+ 
+ 	iwl_free_resp(&cmd);
+@@ -809,36 +813,58 @@ static int iwl_mvm_sar_geo_init(struct iwl_mvm *mvm)
+ 	union iwl_geo_tx_power_profiles_cmd cmd;
+ 	u16 len;
+ 	u32 n_bands;
++	u32 n_profiles;
+ 	int ret;
+ 	u8 cmd_ver = iwl_fw_lookup_cmd_ver(mvm->fw, PHY_OPS_GROUP,
+-					   GEO_TX_POWER_LIMIT,
++					   PER_CHAIN_LIMIT_OFFSET_CMD,
+ 					   IWL_FW_CMD_VER_UNKNOWN);
+ 
+ 	BUILD_BUG_ON(offsetof(struct iwl_geo_tx_power_profiles_cmd_v1, ops) !=
+ 		     offsetof(struct iwl_geo_tx_power_profiles_cmd_v2, ops) ||
+ 		     offsetof(struct iwl_geo_tx_power_profiles_cmd_v2, ops) !=
+-		     offsetof(struct iwl_geo_tx_power_profiles_cmd_v3, ops));
++		     offsetof(struct iwl_geo_tx_power_profiles_cmd_v3, ops) ||
++		     offsetof(struct iwl_geo_tx_power_profiles_cmd_v3, ops) !=
++		     offsetof(struct iwl_geo_tx_power_profiles_cmd_v4, ops) ||
++		     offsetof(struct iwl_geo_tx_power_profiles_cmd_v4, ops) !=
++		     offsetof(struct iwl_geo_tx_power_profiles_cmd_v5, ops));
++
+ 	/* the ops field is at the same spot for all versions, so set in v1 */
+ 	cmd.v1.ops = cpu_to_le32(IWL_PER_CHAIN_OFFSET_SET_TABLES);
+ 
+-	if (cmd_ver == 3) {
++	if (cmd_ver == 5) {
++		len = sizeof(cmd.v5);
++		n_bands = ARRAY_SIZE(cmd.v5.table[0]);
++		n_profiles = ACPI_NUM_GEO_PROFILES_REV3;
++	} else if (cmd_ver == 4) {
++		len = sizeof(cmd.v4);
++		n_bands = ARRAY_SIZE(cmd.v4.table[0]);
++		n_profiles = ACPI_NUM_GEO_PROFILES_REV3;
++	} else if (cmd_ver == 3) {
+ 		len = sizeof(cmd.v3);
+ 		n_bands = ARRAY_SIZE(cmd.v3.table[0]);
++		n_profiles = ACPI_NUM_GEO_PROFILES;
+ 	} else if (fw_has_api(&mvm->fwrt.fw->ucode_capa,
+ 			      IWL_UCODE_TLV_API_SAR_TABLE_VER)) {
+ 		len = sizeof(cmd.v2);
+ 		n_bands = ARRAY_SIZE(cmd.v2.table[0]);
++		n_profiles = ACPI_NUM_GEO_PROFILES;
+ 	} else {
+ 		len = sizeof(cmd.v1);
+ 		n_bands = ARRAY_SIZE(cmd.v1.table[0]);
++		n_profiles = ACPI_NUM_GEO_PROFILES;
+ 	}
+ 
+ 	BUILD_BUG_ON(offsetof(struct iwl_geo_tx_power_profiles_cmd_v1, table) !=
+ 		     offsetof(struct iwl_geo_tx_power_profiles_cmd_v2, table) ||
+ 		     offsetof(struct iwl_geo_tx_power_profiles_cmd_v2, table) !=
+-		     offsetof(struct iwl_geo_tx_power_profiles_cmd_v3, table));
++		     offsetof(struct iwl_geo_tx_power_profiles_cmd_v3, table) ||
++		     offsetof(struct iwl_geo_tx_power_profiles_cmd_v3, table) !=
++		     offsetof(struct iwl_geo_tx_power_profiles_cmd_v4, table) ||
++		     offsetof(struct iwl_geo_tx_power_profiles_cmd_v4, table) !=
++		     offsetof(struct iwl_geo_tx_power_profiles_cmd_v5, table));
+ 	/* the table is at the same position for all versions, so set use v1 */
+-	ret = iwl_sar_geo_init(&mvm->fwrt, &cmd.v1.table[0][0], n_bands);
++	ret = iwl_sar_geo_init(&mvm->fwrt, &cmd.v1.table[0][0],
++			       n_bands, n_profiles);
+ 
+ 	/*
+ 	 * It is a valid scenario to not support SAR, or miss wgds table,
+@@ -851,14 +877,19 @@ static int iwl_mvm_sar_geo_init(struct iwl_mvm *mvm)
+ 	 * Set the revision on versions that contain it.
+ 	 * This must be done after calling iwl_sar_geo_init().
+ 	 */
+-	if (cmd_ver == 3)
++	if (cmd_ver == 5)
++		cmd.v5.table_revision = cpu_to_le32(mvm->fwrt.geo_rev);
++	else if (cmd_ver == 4)
++		cmd.v4.table_revision = cpu_to_le32(mvm->fwrt.geo_rev);
++	else if (cmd_ver == 3)
+ 		cmd.v3.table_revision = cpu_to_le32(mvm->fwrt.geo_rev);
+ 	else if (fw_has_api(&mvm->fwrt.fw->ucode_capa,
+ 			    IWL_UCODE_TLV_API_SAR_TABLE_VER))
+ 		cmd.v2.table_revision = cpu_to_le32(mvm->fwrt.geo_rev);
+ 
+ 	return iwl_mvm_send_cmd_pdu(mvm,
+-				    WIDE_ID(PHY_OPS_GROUP, GEO_TX_POWER_LIMIT),
++				    WIDE_ID(PHY_OPS_GROUP,
++					    PER_CHAIN_LIMIT_OFFSET_CMD),
+ 				    0, len, &cmd);
+ }
+ 
+@@ -1108,7 +1139,7 @@ static void iwl_mvm_tas_init(struct iwl_mvm *mvm)
+ static u8 iwl_mvm_eval_dsm_rfi(struct iwl_mvm *mvm)
+ {
+ 	u8 value;
+-	int ret = iwl_acpi_get_dsm_u8((&mvm->fwrt)->dev, 0, DSM_RFI_FUNC_ENABLE,
++	int ret = iwl_acpi_get_dsm_u8(mvm->fwrt.dev, 0, DSM_RFI_FUNC_ENABLE,
+ 				      &iwl_rfi_guid, &value);
+ 
+ 	if (ret < 0) {
+@@ -1133,30 +1164,45 @@ static void iwl_mvm_lari_cfg(struct iwl_mvm *mvm)
+ {
+ 	int ret;
+ 	u32 value;
+-	struct iwl_lari_config_change_cmd_v4 cmd = {};
++	struct iwl_lari_config_change_cmd_v5 cmd = {};
+ 
+ 	cmd.config_bitmap = iwl_acpi_get_lari_config_bitmap(&mvm->fwrt);
+ 
+-	ret = iwl_acpi_get_dsm_u32((&mvm->fwrt)->dev, 0, DSM_FUNC_11AX_ENABLEMENT,
++	ret = iwl_acpi_get_dsm_u32(mvm->fwrt.dev, 0, DSM_FUNC_11AX_ENABLEMENT,
+ 				   &iwl_guid, &value);
+ 	if (!ret)
+ 		cmd.oem_11ax_allow_bitmap = cpu_to_le32(value);
+-	/* apply more config masks here */
+ 
+-	ret = iwl_acpi_get_dsm_u32((&mvm->fwrt)->dev, 0,
++	ret = iwl_acpi_get_dsm_u32(mvm->fwrt.dev, 0,
+ 				   DSM_FUNC_ENABLE_UNII4_CHAN,
+ 				   &iwl_guid, &value);
+ 	if (!ret)
+ 		cmd.oem_unii4_allow_bitmap = cpu_to_le32(value);
+ 
++	ret = iwl_acpi_get_dsm_u32(mvm->fwrt.dev, 0,
++				   DSM_FUNC_ACTIVATE_CHANNEL,
++				   &iwl_guid, &value);
++	if (!ret)
++		cmd.chan_state_active_bitmap = cpu_to_le32(value);
++
++	ret = iwl_acpi_get_dsm_u32(mvm->fwrt.dev, 0,
++				   DSM_FUNC_ENABLE_6E,
++				   &iwl_guid, &value);
++	if (!ret)
++		cmd.oem_uhb_allow_bitmap = cpu_to_le32(value);
++
+ 	if (cmd.config_bitmap ||
++	    cmd.oem_uhb_allow_bitmap ||
+ 	    cmd.oem_11ax_allow_bitmap ||
+-	    cmd.oem_unii4_allow_bitmap) {
++	    cmd.oem_unii4_allow_bitmap ||
++	    cmd.chan_state_active_bitmap) {
+ 		size_t cmd_size;
+ 		u8 cmd_ver = iwl_fw_lookup_cmd_ver(mvm->fw,
+ 						   REGULATORY_AND_NVM_GROUP,
+ 						   LARI_CONFIG_CHANGE, 1);
+-		if (cmd_ver == 4)
++		if (cmd_ver == 5)
++			cmd_size = sizeof(struct iwl_lari_config_change_cmd_v5);
++		else if (cmd_ver == 4)
+ 			cmd_size = sizeof(struct iwl_lari_config_change_cmd_v4);
+ 		else if (cmd_ver == 3)
+ 			cmd_size = sizeof(struct iwl_lari_config_change_cmd_v3);
+@@ -1170,9 +1216,13 @@ static void iwl_mvm_lari_cfg(struct iwl_mvm *mvm)
+ 				le32_to_cpu(cmd.config_bitmap),
+ 				le32_to_cpu(cmd.oem_11ax_allow_bitmap));
+ 		IWL_DEBUG_RADIO(mvm,
+-				"sending LARI_CONFIG_CHANGE, oem_unii4_allow_bitmap=0x%x, cmd_ver=%d\n",
++				"sending LARI_CONFIG_CHANGE, oem_unii4_allow_bitmap=0x%x, chan_state_active_bitmap=0x%x, cmd_ver=%d\n",
+ 				le32_to_cpu(cmd.oem_unii4_allow_bitmap),
++				le32_to_cpu(cmd.chan_state_active_bitmap),
+ 				cmd_ver);
++		IWL_DEBUG_RADIO(mvm,
++				"sending LARI_CONFIG_CHANGE, oem_uhb_allow_bitmap=0x%x\n",
++				le32_to_cpu(cmd.oem_uhb_allow_bitmap));
+ 		ret = iwl_mvm_send_cmd_pdu(mvm,
+ 					   WIDE_ID(REGULATORY_AND_NVM_GROUP,
+ 						   LARI_CONFIG_CHANGE),
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mac-ctxt.c b/drivers/net/wireless/intel/iwlwifi/mvm/mac-ctxt.c
+index fd352b262..53088f4b8 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mac-ctxt.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mac-ctxt.c
+@@ -604,6 +604,12 @@ static int iwl_mvm_mac_ctxt_cmd_sta(struct iwl_mvm *mvm,
+ 
+ 		ctxt_sta->is_assoc = cpu_to_le32(1);
+ 
++		if (!mvmvif->authorized &&
++		    fw_has_capa(&mvm->fw->ucode_capa,
++				IWL_UCODE_TLV_CAPA_COEX_HIGH_PRIO))
++			ctxt_sta->data_policy |=
++				cpu_to_le32(COEX_HIGH_PRIORITY_ENABLE);
++
+ 		/*
+ 		 * allow multicast data frames only as long as the station is
+ 		 * authorized, i.e., GTK keys are already installed (if needed)
+@@ -1535,11 +1541,11 @@ void iwl_mvm_probe_resp_data_notif(struct iwl_mvm *mvm,
+ 		ieee80211_beacon_set_cntdwn(vif, notif->csa_counter);
+ }
+ 
+-void iwl_mvm_channel_switch_noa_notif(struct iwl_mvm *mvm,
+-				      struct iwl_rx_cmd_buffer *rxb)
++void iwl_mvm_channel_switch_start_notif(struct iwl_mvm *mvm,
++					struct iwl_rx_cmd_buffer *rxb)
+ {
+ 	struct iwl_rx_packet *pkt = rxb_addr(rxb);
+-	struct iwl_channel_switch_noa_notif *notif = (void *)pkt->data;
++	struct iwl_channel_switch_start_notif *notif = (void *)pkt->data;
+ 	struct ieee80211_vif *csa_vif, *vif;
+ 	struct iwl_mvm_vif *mvmvif;
+ 	u32 id_n_color, csa_id, mac_id;
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c b/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
+index fa7de3e47..f94ef1a56 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
+@@ -2275,6 +2275,34 @@ static void iwl_mvm_cfg_he_sta(struct iwl_mvm *mvm,
+ 		IWL_ERR(mvm, "Failed to config FW to work HE!\n");
+ }
+ 
++static void iwl_mvm_protect_assoc(struct iwl_mvm *mvm,
++				  struct ieee80211_vif *vif,
++				  u32 duration_override)
++{
++	u32 duration = IWL_MVM_TE_SESSION_PROTECTION_MAX_TIME_MS;
++	u32 min_duration = IWL_MVM_TE_SESSION_PROTECTION_MIN_TIME_MS;
++
++	if (duration_override > duration)
++		duration = duration_override;
++
++	/* Try really hard to protect the session and hear a beacon
++	 * The new session protection command allows us to protect the
++	 * session for a much longer time since the firmware will internally
++	 * create two events: a 300TU one with a very high priority that
++	 * won't be fragmented which should be enough for 99% of the cases,
++	 * and another one (which we configure here to be 900TU long) which
++	 * will have a slightly lower priority, but more importantly, can be
++	 * fragmented so that it'll allow other activities to run.
++	 */
++	if (fw_has_capa(&mvm->fw->ucode_capa,
++			IWL_UCODE_TLV_CAPA_SESSION_PROT_CMD))
++		iwl_mvm_schedule_session_protection(mvm, vif, 900,
++						    min_duration, false);
++	else
++		iwl_mvm_protect_session(mvm, vif, duration,
++					min_duration, 500, false);
++}
++
+ static void iwl_mvm_bss_info_changed_station(struct iwl_mvm *mvm,
+ 					     struct ieee80211_vif *vif,
+ 					     struct ieee80211_bss_conf *bss_conf,
+@@ -2358,6 +2386,20 @@ static void iwl_mvm_bss_info_changed_station(struct iwl_mvm *mvm,
+ 				u32 dur = (11 * vif->bss_conf.beacon_int) / 10;
+ 				iwl_mvm_protect_session(mvm, vif, dur, dur,
+ 							5 * dur, false);
++			} else if (!test_bit(IWL_MVM_STATUS_IN_HW_RESTART,
++					     &mvm->status) &&
++				   !vif->bss_conf.dtim_period) {
++				/*
++				 * If we're not restarting and still haven't
++				 * heard a beacon (dtim period unknown) then
++				 * make sure we still have enough minimum time
++				 * remaining in the time event, since the auth
++				 * might actually have taken quite a while
++				 * (especially for SAE) and so the remaining
++				 * time could be small without us having heard
++				 * a beacon yet.
++				 */
++				iwl_mvm_protect_assoc(mvm, vif, 0);
+ 			}
+ 
+ 			iwl_mvm_sf_update(mvm, vif, false);
+@@ -3240,6 +3282,8 @@ static int iwl_mvm_mac_sta_state(struct ieee80211_hw *hw,
+ 		/* enable beacon filtering */
+ 		WARN_ON(iwl_mvm_enable_beacon_filter(mvm, vif, 0));
+ 
++		mvmvif->authorized = 1;
++
+ 		/*
+ 		 * Now that the station is authorized, i.e., keys were already
+ 		 * installed, need to indicate to the FW that
+@@ -3254,6 +3298,12 @@ static int iwl_mvm_mac_sta_state(struct ieee80211_hw *hw,
+ 		/* Multicast data frames are no longer allowed */
+ 		iwl_mvm_mac_ctxt_changed(mvm, vif, false, NULL);
+ 
++		/*
++		 * Set this after the above iwl_mvm_mac_ctxt_changed()
++		 * to avoid sending high prio again for a little time.
++		 */
++		mvmvif->authorized = 0;
++
+ 		/* disable beacon filtering */
+ 		ret = iwl_mvm_disable_beacon_filter(mvm, vif, 0);
+ 		WARN_ON(ret &&
+@@ -3265,6 +3315,9 @@ static int iwl_mvm_mac_sta_state(struct ieee80211_hw *hw,
+ 		if (vif->type == NL80211_IFTYPE_AP) {
+ 			mvmvif->ap_assoc_sta_count--;
+ 			iwl_mvm_mac_ctxt_changed(mvm, vif, false, NULL);
++		} else if (vif->type == NL80211_IFTYPE_STATION && !sta->tdls) {
++			/* remove session protection if still running */
++			iwl_mvm_stop_session_protection(mvm, vif);
+ 		}
+ 		ret = 0;
+ 	} else if (old_state == IEEE80211_STA_AUTH &&
+@@ -3357,29 +3410,9 @@ static void iwl_mvm_mac_mgd_prepare_tx(struct ieee80211_hw *hw,
+ 				       struct ieee80211_prep_tx_info *info)
+ {
+ 	struct iwl_mvm *mvm = IWL_MAC80211_GET_MVM(hw);
+-	u32 duration = IWL_MVM_TE_SESSION_PROTECTION_MAX_TIME_MS;
+-	u32 min_duration = IWL_MVM_TE_SESSION_PROTECTION_MIN_TIME_MS;
+-
+-	if (info->duration > duration)
+-		duration = info->duration;
+ 
+ 	mutex_lock(&mvm->mutex);
+-	/* Try really hard to protect the session and hear a beacon
+-	 * The new session protection command allows us to protect the
+-	 * session for a much longer time since the firmware will internally
+-	 * create two events: a 300TU one with a very high priority that
+-	 * won't be fragmented which should be enough for 99% of the cases,
+-	 * and another one (which we configure here to be 900TU long) which
+-	 * will have a slightly lower priority, but more importantly, can be
+-	 * fragmented so that it'll allow other activities to run.
+-	 */
+-	if (fw_has_capa(&mvm->fw->ucode_capa,
+-			IWL_UCODE_TLV_CAPA_SESSION_PROT_CMD))
+-		iwl_mvm_schedule_session_protection(mvm, vif, 900,
+-						    min_duration, false);
+-	else
+-		iwl_mvm_protect_session(mvm, vif, duration,
+-					min_duration, 500, false);
++	iwl_mvm_protect_assoc(mvm, vif, info->duration);
+ 	mutex_unlock(&mvm->mutex);
+ }
+ 
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h b/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
+index 6b59425db..01bb60f9d 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
+@@ -297,6 +297,7 @@ struct iwl_probe_resp_data {
+  *	see enum &iwl_mvm_low_latency_cause for causes.
+  * @low_latency_actual: boolean, indicates low latency is set,
+  *	as a result from low_latency bit flags and takes force into account.
++ * @authorized: indicates the AP station was set to authorized
+  * @ps_disabled: indicates that this interface requires PS to be disabled
+  * @queue_params: QoS params for this MAC
+  * @bcast_sta: station used for broadcast packets. Used by the following
+@@ -330,6 +331,7 @@ struct iwl_mvm_vif {
+ 	bool monitor_active;
+ 	u8 low_latency: 6;
+ 	u8 low_latency_actual: 1;
++	u8 authorized:1;
+ 	bool ps_disabled;
+ 	struct iwl_mvm_vif_bf_data bf_data;
+ 
+@@ -1654,8 +1656,8 @@ void iwl_mvm_probe_resp_data_notif(struct iwl_mvm *mvm,
+ 				   struct iwl_rx_cmd_buffer *rxb);
+ void iwl_mvm_rx_missed_vap_notif(struct iwl_mvm *mvm,
+ 				 struct iwl_rx_cmd_buffer *rxb);
+-void iwl_mvm_channel_switch_noa_notif(struct iwl_mvm *mvm,
+-				      struct iwl_rx_cmd_buffer *rxb);
++void iwl_mvm_channel_switch_start_notif(struct iwl_mvm *mvm,
++					struct iwl_rx_cmd_buffer *rxb);
+ /* Bindings */
+ int iwl_mvm_binding_add_vif(struct iwl_mvm *mvm, struct ieee80211_vif *vif);
+ int iwl_mvm_binding_remove_vif(struct iwl_mvm *mvm, struct ieee80211_vif *vif);
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/nvm.c b/drivers/net/wireless/intel/iwlwifi/mvm/nvm.c
+index 8a9732b5b..fdf60afb0 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/nvm.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/nvm.c
+@@ -593,8 +593,9 @@ void iwl_mvm_rx_chub_update_mcc(struct iwl_mvm *mvm,
+ 		return;
+ 
+ 	wgds_tbl_idx = iwl_mvm_get_sar_geo_profile(mvm);
+-	if (wgds_tbl_idx < 0)
+-		IWL_DEBUG_INFO(mvm, "SAR WGDS is disabled (%d)\n",
++	if (wgds_tbl_idx < 1)
++		IWL_DEBUG_INFO(mvm,
++			       "SAR WGDS is disabled or error received (%d)\n",
+ 			       wgds_tbl_idx);
+ 	else
+ 		IWL_DEBUG_INFO(mvm, "SAR WGDS: geo profile %d is configured\n",
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/ops.c b/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
+index 3ee4b3ecd..a1bf4dded 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
+@@ -385,9 +385,9 @@ static const struct iwl_rx_handlers iwl_mvm_rx_handlers[] = {
+ 		       iwl_mvm_probe_resp_data_notif,
+ 		       RX_HANDLER_ASYNC_LOCKED,
+ 		       struct iwl_probe_resp_data_notif),
+-	RX_HANDLER_GRP(MAC_CONF_GROUP, CHANNEL_SWITCH_NOA_NOTIF,
+-		       iwl_mvm_channel_switch_noa_notif,
+-		       RX_HANDLER_SYNC, struct iwl_channel_switch_noa_notif),
++	RX_HANDLER_GRP(MAC_CONF_GROUP, CHANNEL_SWITCH_START_NOTIF,
++		       iwl_mvm_channel_switch_start_notif,
++		       RX_HANDLER_SYNC, struct iwl_channel_switch_start_notif),
+ 	RX_HANDLER_GRP(DATA_PATH_GROUP, MONITOR_NOTIF,
+ 		       iwl_mvm_rx_monitor_notif, RX_HANDLER_ASYNC_LOCKED,
+ 		       struct iwl_datapath_monitor_notif),
+@@ -513,7 +513,7 @@ static const struct iwl_hcmd_names iwl_mvm_mac_conf_names[] = {
+ 	HCMD_NAME(CHANNEL_SWITCH_TIME_EVENT_CMD),
+ 	HCMD_NAME(SESSION_PROTECTION_CMD),
+ 	HCMD_NAME(SESSION_PROTECTION_NOTIF),
+-	HCMD_NAME(CHANNEL_SWITCH_NOA_NOTIF),
++	HCMD_NAME(CHANNEL_SWITCH_START_NOTIF),
+ };
+ 
+ /* Please keep this array *SORTED* by hex value.
+@@ -523,7 +523,7 @@ static const struct iwl_hcmd_names iwl_mvm_phy_names[] = {
+ 	HCMD_NAME(CMD_DTS_MEASUREMENT_TRIGGER_WIDE),
+ 	HCMD_NAME(CTDP_CONFIG_CMD),
+ 	HCMD_NAME(TEMP_REPORTING_THRESHOLDS_CMD),
+-	HCMD_NAME(GEO_TX_POWER_LIMIT),
++	HCMD_NAME(PER_CHAIN_LIMIT_OFFSET_CMD),
+ 	HCMD_NAME(CT_KILL_NOTIFICATION),
+ 	HCMD_NAME(DTS_MEASUREMENT_NOTIF_WIDE),
+ };
+diff --git a/drivers/net/wireless/intel/iwlwifi/pcie/ctxt-info-gen3.c b/drivers/net/wireless/intel/iwlwifi/pcie/ctxt-info-gen3.c
+index 239a722cd..85a6da70c 100644
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/ctxt-info-gen3.c
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/ctxt-info-gen3.c
+@@ -57,6 +57,10 @@ iwl_pcie_ctxt_info_dbg_enable(struct iwl_trans *trans,
+ 			dbg_flags |= IWL_PRPH_SCRATCH_EDBG_DEST_DRAM;
+ 			dbg_cfg->hwm_base_addr = cpu_to_le64(frag->physical);
+ 			dbg_cfg->hwm_size = cpu_to_le32(frag->size);
++			dbg_cfg->debug_token_config = cpu_to_le32(trans->dbg.ucode_preset);
++			IWL_DEBUG_FW(trans,
++				     "WRT: Applying DRAM destination (debug_token_config=%u)\n",
++				     dbg_cfg->debug_token_config);
+ 			IWL_DEBUG_FW(trans,
+ 				     "WRT: Applying DRAM destination (alloc_id=%u, num_frags=%u)\n",
+ 				     alloc_id,

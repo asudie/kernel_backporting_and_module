@@ -1,0 +1,91 @@
+diff --git a/entry_creator/Makefile b/entry_creator/Makefile
+new file mode 100644
+index 000000000..0a2eb16ca
+--- /dev/null
++++ b/entry_creator/Makefile
+@@ -0,0 +1,6 @@
++obj-m += entry_creator.o
++
++all:
++        make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
++clean:
++        make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean;
+diff --git a/entry_creator/entry_creator.c b/entry_creator/entry_creator.c
+new file mode 100644
+index 000000000..d201943b4
+--- /dev/null
++++ b/entry_creator/entry_creator.c
+@@ -0,0 +1,73 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Copyright 2024 Aleksandra Smolniakova.
++ */
++
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/proc_fs.h>
++#include <linux/uaccess.h>
++#include <linux/slab.h>
++
++MODULE_AUTHOR("Aleksandra Smolniakova");
++MODULE_DESCRIPTION("Creating a proc entry");
++MODULE_LICENSE("GPL");
++
++#define NAME "entry_creator"
++#define BUFFER_SIZE 1024
++
++static char *buffer;
++static unsigned long buffer_size = 0;
++static struct mutex proc_mutex;
++
++ssize_t proc_read(struct file *file, char __user *user_buf, size_t count, loff_t *pos) {
++    ssize_t res;
++
++    mutex_lock(&proc_mutex);
++
++    res = simple_read_from_buffer(user_buf, count, pos, buffer, buffer_size);
++
++    mutex_unlock(&proc_mutex);
++
++    return res;
++}
++
++ssize_t proc_write(struct file *file, const char __user *user_buf, size_t count, loff_t *pos)
++{
++    mutex_lock(&proc_mutex);
++    if (count > BUFFER_SIZE)
++        buffer_size = BUFFER_SIZE;
++    else
++        buffer_size = count;
++
++    if (copy_from_user(buffer, user_buf, buffer_size)) {
++        mutex_unlock(&proc_mutex);
++        return -EFAULT;
++    }
++    mutex_unlock(&proc_mutex);
++    return buffer_size;
++}
++static const struct proc_ops proc_file_ops = {
++    .proc_read = proc_read,
++    .proc_write = proc_write,
++};
++
++static int __init entry_creator_init(void) {
++    buffer = kmalloc(BUFFER_SIZE, GFP_KERNEL);
++    if (!buffer) {
++        return -ENOMEM;
++    }
++
++    proc_create(NAME, 0666, NULL, &proc_file_ops);
++    printk(KERN_INFO "Entry creator is loaded! Entry %s is created! \n", NAME);
++    return 0;
++}
++
++static void __exit entry_creator_exit(void) {
++    remove_proc_entry(NAME, NULL);
++    kfree(buffer);
++    printk(KERN_INFO "Entry creator is unloaded! Entry %s is removed!\n", NAME);
++}
++
++module_init(entry_creator_init);
++module_exit(entry_creator_exit);
